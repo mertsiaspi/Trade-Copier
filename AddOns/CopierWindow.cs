@@ -2,11 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Media;
-using System.Windows.Shapes;
 using System.Windows.Threading;
 using System.Xml.Linq;
 using NinjaTrader.Cbi;
@@ -41,8 +41,6 @@ namespace NinjaTrader.Gui.NinjaScript
 
 		// Fired on every evaluation tick so open dashboard windows can refresh.
 		public static event EventHandler Tick;
-		public static event EventHandler Started;
-		public static event EventHandler Stopped;
 
 		public static void Start(AccountState master, IEnumerable<AccountState> followers)
 		{
@@ -62,8 +60,6 @@ namespace NinjaTrader.Gui.NinjaScript
 			timer.Interval = TimeSpan.FromSeconds(1);
 			timer.Tick += OnTimerTick;
 			timer.Start();
-
-			RaiseEvent(Started);
 		}
 
 		public static void Stop()
@@ -82,8 +78,6 @@ namespace NinjaTrader.Gui.NinjaScript
 			RiskManager = null;
 			Master = null;
 			Followers = null;
-
-			RaiseEvent(Stopped);
 		}
 
 		private static void OnBreachDetected(object sender, RiskBreachEventArgs e)
@@ -104,11 +98,7 @@ namespace NinjaTrader.Gui.NinjaScript
 				Engine.RunReconciliation();
 			}
 
-			RaiseEvent(Tick);
-		}
-
-		private static void RaiseEvent(EventHandler handler)
-		{
+			EventHandler handler = Tick;
 			if (handler != null)
 				handler(null, EventArgs.Empty);
 		}
@@ -169,10 +159,14 @@ namespace NinjaTrader.Gui.NinjaScript
 		}
 	}
 
-	// One row bound into the live follower DataGrid. Plain properties raise
-	// PropertyChanged so the grid updates on each CopierManager.Tick without
-	// touching the grid itself.
-	public class FollowerRow : INotifyPropertyChanged
+	// One row per connected account, shared by both dashboard tabs (Tab 1
+	// shows a filtered view that excludes whichever account is master). All
+	// property setters proxy straight onto the underlying AccountState so
+	// edits take effect immediately - live-tunable multiplier/risk limits are
+	// intentional, not an oversight. The one exception is starting balance,
+	// which only applies (and reseeds the trailing high-water-mark) when the
+	// user clicks Arm/Rearm - see CopierWindow.ApplyPendingStartingBalance.
+	public class AccountRow : INotifyPropertyChanged
 	{
 		public event PropertyChangedEventHandler PropertyChanged;
 
@@ -185,89 +179,165 @@ namespace NinjaTrader.Gui.NinjaScript
 
 		public AccountState State { get; }
 
-		public FollowerRow(AccountState state)
+		public AccountRow(AccountState state)
 		{
 			State = state;
+			PendingStartingBalance = state.StartingBalance.ToString(CultureInfo.InvariantCulture);
 		}
 
 		public string Name { get { return State.DisplayName; } }
+		public bool IsMaster { get { return State.Role == AccountRole.Master; } }
 
-		private string connection = "Unknown";
-		public string Connection { get { return connection; } set { connection = value; Raise("Connection"); } }
+		// ----- Tab 1: Trade Copier -----
 
-		private string position = "Flat";
+		private bool includeAsFollower;
+		public bool IncludeAsFollower
+		{
+			get { return includeAsFollower; }
+			set { includeAsFollower = value; Raise("IncludeAsFollower"); }
+		}
+
+		public string Multiplier
+		{
+			get { return State.QuantityMultiplier.ToString(CultureInfo.InvariantCulture); }
+			set
+			{
+				decimal parsed;
+				if (decimal.TryParse(value, out parsed))
+					State.QuantityMultiplier = parsed;
+				Raise("Multiplier");
+			}
+		}
+
+		private string position = "-";
 		public string Position { get { return position; } set { position = value; Raise("Position"); } }
 
-		private string realizedPnl = "";
+		private string realizedPnl = "-";
 		public string RealizedPnl { get { return realizedPnl; } set { realizedPnl = value; Raise("RealizedPnl"); } }
 
-		private string unrealizedPnl = "";
+		private Brush realizedPnlBrush = Brushes.Gainsboro;
+		public Brush RealizedPnlBrush { get { return realizedPnlBrush; } set { realizedPnlBrush = value; Raise("RealizedPnlBrush"); } }
+
+		private string unrealizedPnl = "-";
 		public string UnrealizedPnl { get { return unrealizedPnl; } set { unrealizedPnl = value; Raise("UnrealizedPnl"); } }
 
-		private string drb = "off";
-		public string Drb { get { return drb; } set { drb = value; Raise("Drb"); } }
+		private Brush unrealizedPnlBrush = Brushes.Gainsboro;
+		public Brush UnrealizedPnlBrush { get { return unrealizedPnlBrush; } set { unrealizedPnlBrush = value; Raise("UnrealizedPnlBrush"); } }
 
-		private string trailingDd = "off";
-		public string TrailingDd { get { return trailingDd; } set { trailingDd = value; Raise("TrailingDd"); } }
-
-		private string stats = "0/0/0";
-		public string Stats { get { return stats; } set { stats = value; Raise("Stats"); } }
-
-		private string status = "OK";
+		private string status = "Not armed";
 		public string Status { get { return status; } set { status = value; Raise("Status"); } }
 
 		private Brush statusBrush = Brushes.Gray;
 		public Brush StatusBrush { get { return statusBrush; } set { statusBrush = value; Raise("StatusBrush"); } }
+
+		// ----- Tab 2: Risk Monitor & Settings -----
+
+		private string netLiquidation = "-";
+		public string NetLiquidation { get { return netLiquidation; } set { netLiquidation = value; Raise("NetLiquidation"); } }
+
+		private string autoLiquidateFloor = "-";
+		public string AutoLiquidateFloor { get { return autoLiquidateFloor; } set { autoLiquidateFloor = value; Raise("AutoLiquidateFloor"); } }
+
+		private string distanceToAuto = "-";
+		public string DistanceToAuto { get { return distanceToAuto; } set { distanceToAuto = value; Raise("DistanceToAuto"); } }
+
+		private Brush distanceToAutoBrush = Brushes.Gainsboro;
+		public Brush DistanceToAutoBrush { get { return distanceToAutoBrush; } set { distanceToAutoBrush = value; Raise("DistanceToAutoBrush"); } }
+
+		public string DailyRiskBudget
+		{
+			get { return State.DailyRiskBudget.ToString(CultureInfo.InvariantCulture); }
+			set
+			{
+				decimal parsed;
+				if (decimal.TryParse(value, out parsed))
+					State.DailyRiskBudget = parsed;
+				Raise("DailyRiskBudget");
+			}
+		}
+
+		public string MaxDrawdown
+		{
+			get { return State.MaxDrawdownAmount.ToString(CultureInfo.InvariantCulture); }
+			set
+			{
+				decimal parsed;
+				if (decimal.TryParse(value, out parsed))
+					State.MaxDrawdownAmount = parsed;
+				Raise("MaxDrawdown");
+			}
+		}
+
+		public DrawdownType DrawdownTypeValue
+		{
+			get { return State.DrawdownType; }
+			set { State.DrawdownType = value; Raise("DrawdownTypeValue"); }
+		}
+
+		public string FreezeOffset
+		{
+			get { return State.TrailingStopFreezeOffset.ToString(CultureInfo.InvariantCulture); }
+			set
+			{
+				decimal parsed;
+				if (decimal.TryParse(value, out parsed))
+					State.TrailingStopFreezeOffset = parsed;
+				Raise("FreezeOffset");
+			}
+		}
+
+		// Plain pending text, deliberately NOT proxied straight onto State -
+		// see the class-level comment above.
+		public string PendingStartingBalance { get; set; }
 	}
 
 	public class CopierWindow : NTWindow, IWorkspacePersistence
 	{
-		// Display-only heuristic for the dashboard's "warning" color - does
-		// NOT affect actual risk enforcement, RiskManager decides that
-		// independently. Warns once 80% of a configured budget is used.
+		// ----- Hand-rolled dark theme -----
+		// NOTE: deliberately not using Application.Current.FindResource(...)
+		// with guessed NinjaTrader theme keys here - a wrong key throws at
+		// runtime when the window opens (worse than just looking slightly
+		// off), and I could not confirm exact key names for a plain
+		// window/DataGrid background. These colors are hand-picked to match
+		// NinjaTrader's own dark skin closely; tell me if they clash.
+		private static readonly Brush ThemeBackground = new SolidColorBrush(Color.FromRgb(0x1E, 0x1E, 0x1E));
+		private static readonly Brush ThemePanelBackground = new SolidColorBrush(Color.FromRgb(0x25, 0x25, 0x26));
+		private static readonly Brush ThemeRowBackground = new SolidColorBrush(Color.FromRgb(0x2D, 0x2D, 0x30));
+		private static readonly Brush ThemeRowAltBackground = new SolidColorBrush(Color.FromRgb(0x26, 0x26, 0x28));
+		private static readonly Brush ThemeHeaderBackground = new SolidColorBrush(Color.FromRgb(0x33, 0x33, 0x36));
+		private static readonly Brush ThemeBorder = new SolidColorBrush(Color.FromRgb(0x3F, 0x3F, 0x46));
+		private static readonly Brush ThemeForeground = new SolidColorBrush(Color.FromRgb(0xE0, 0xE0, 0xE0));
+
+		// Display-only heuristics for warning colors - these do NOT affect
+		// actual risk enforcement, RiskManager decides that independently.
 		private const decimal WarningThresholdFraction = 0.2m;
+		private const decimal DistanceDangerDollars = 500m;
+		private const decimal DistanceWarningDollars = 1000m;
 
-		private class FollowerSetupRow
-		{
-			public Account Account;
-			public CheckBox EnabledCheckBox;
-			public TextBox MultiplierBox;
-			public TextBox MaxContractsBox;
-			public TextBox DailyRiskBudgetBox;
-			public TextBox MaxDrawdownBox;
-			public ComboBox DrawdownTypeCombo;
-			public TextBox StartingBalanceBox;
-			public TextBox FreezeOffsetBox;
-		}
-
-		private readonly Grid rootGrid = new Grid();
-		private readonly List<FollowerSetupRow> followerSetupRows = new List<FollowerSetupRow>();
-		private readonly ObservableCollection<FollowerRow> followerRows = new ObservableCollection<FollowerRow>();
+		private readonly ObservableCollection<AccountRow> accountRows = new ObservableCollection<AccountRow>();
 		private readonly ObservableCollection<string> logLines = new ObservableCollection<string>();
+		private readonly CollectionViewSource followerView = new CollectionViewSource();
 
 		private ComboBox masterCombo;
-		private FrameworkElement setupPanel;
-		private FrameworkElement dashboardPanel;
-
-		private TextBlock masterNameText;
-		private TextBlock masterConnectionText;
-		private TextBlock masterPositionText;
-		private TextBlock masterPnlText;
-		private TextBlock masterStatusText;
+		private Button armButton;
+		private TextBlock masterSummaryText;
 		private Border masterStatusIndicator;
+		private CopierEngine subscribedEngine;
 
 		public CopierWindow()
 		{
 			Caption = "Trade Copier";
-			Width = 900;
-			Height = 600;
+			Width = 1100;
+			Height = 650;
+			Background = ThemeBackground;
 
-			Content = rootGrid;
+			followerView.Source = accountRows;
+			followerView.Filter += (s, e) => { e.Accepted = !((AccountRow)e.Item).IsMaster; };
 
-			setupPanel = BuildSetupPanel();
-			dashboardPanel = BuildDashboardPanel();
-			rootGrid.Children.Add(setupPanel);
-			rootGrid.Children.Add(dashboardPanel);
+			TabControl tabControl = new TabControl { Background = ThemeBackground, BorderThickness = new Thickness(0) };
+			tabControl.Items.Add(new TabItem { Header = "Trade Copier", Content = BuildTab1(), Background = ThemePanelBackground, Foreground = ThemeForeground });
+			tabControl.Items.Add(new TabItem { Header = "Risk Monitor & Settings", Content = BuildTab2(), Background = ThemePanelBackground, Foreground = ThemeForeground });
+			Content = tabControl;
 
 			Closed += OnClosed;
 
@@ -276,60 +346,31 @@ namespace NinjaTrader.Gui.NinjaScript
 				if (WorkspaceOptions == null)
 					WorkspaceOptions = new WorkspaceOptions("CopierWindow" + Guid.NewGuid().ToString("N"), this);
 
-				AttachOrShowSetup();
+				RebuildAccountRows();
+				RefreshAllRows();
+				CopierManager.Tick += OnManagerTick;
 			};
 		}
 
-		// IWorkspacePersistence members - this window has no tab control, so
-		// these are safe no-ops.
+		// IWorkspacePersistence members - this window has no tab control that
+		// needs workspace state, so these are safe no-ops.
 		public void Restore(XDocument document, XElement element) { }
 		public void Save(XDocument document, XElement element) { }
 		public WorkspaceOptions WorkspaceOptions { get; set; }
 
-		private void AttachOrShowSetup()
-		{
-			if (CopierManager.IsRunning)
-				AttachToRunningCopier();
-			else
-				ShowSetupScreen();
-
-			CopierManager.Started += OnManagerStarted;
-			CopierManager.Tick += OnManagerTick;
-		}
-
 		private void OnClosed(object sender, EventArgs e)
 		{
-			// Detach only - CopierManager keeps running with the window closed,
-			// per CLAUDE.md's "risk management must not be chart/window bound".
-			CopierManager.Started -= OnManagerStarted;
+			// Detach only - CopierManager keeps running with the window
+			// closed, per CLAUDE.md's "risk management must not be chart/
+			// window bound".
 			CopierManager.Tick -= OnManagerTick;
-
-			if (CopierManager.Engine != null)
-				CopierManager.Engine.LogMessage -= OnEngineLogMessage;
-		}
-
-		private void OnManagerStarted(object sender, EventArgs e)
-		{
-			AttachToRunningCopier();
-		}
-
-		private void AttachToRunningCopier()
-		{
-			followerRows.Clear();
-			foreach (AccountState follower in CopierManager.Followers)
-				followerRows.Add(new FollowerRow(follower));
-
-			CopierManager.Engine.LogMessage += OnEngineLogMessage;
-
-			setupPanel.Visibility = Visibility.Collapsed;
-			dashboardPanel.Visibility = Visibility.Visible;
-
-			RefreshDashboard();
+			if (subscribedEngine != null)
+				subscribedEngine.LogMessage -= OnEngineLogMessage;
 		}
 
 		private void OnManagerTick(object sender, EventArgs e)
 		{
-			Dispatcher.BeginInvoke(new Action(RefreshDashboard));
+			Dispatcher.BeginInvoke(new Action(RefreshAllRows));
 		}
 
 		private void OnEngineLogMessage(object sender, CopierLogEventArgs e)
@@ -344,93 +385,79 @@ namespace NinjaTrader.Gui.NinjaScript
 				logLines.RemoveAt(logLines.Count - 1);
 		}
 
-		// ----- Setup screen -----
+		// ----- Account list -----
 
-		private FrameworkElement BuildSetupPanel()
+		private static bool IsConnected(Account account)
 		{
-			StackPanel panel = new StackPanel { Margin = new Thickness(12) };
-
-			panel.Children.Add(new TextBlock
+			try
 			{
-				Text = "Master account",
-				FontWeight = FontWeights.Bold,
-				Margin = new Thickness(0, 0, 0, 4)
-			});
+				return account.Connection != null && account.Connection.Status == ConnectionStatus.Connected;
+			}
+			catch (Exception)
+			{
+				return false;
+			}
+		}
 
-			List<Account> allAccounts = new List<Account>();
+		private void RebuildAccountRows()
+		{
+			List<Account> connected = new List<Account>();
 			lock (Account.All)
 			{
-				allAccounts.AddRange(Account.All);
+				foreach (Account account in Account.All)
+					if (IsConnected(account))
+						connected.Add(account);
 			}
 
-			masterCombo = new ComboBox { ItemsSource = allAccounts, DisplayMemberPath = "Name", Width = 240, HorizontalAlignment = HorizontalAlignment.Left };
-			panel.Children.Add(masterCombo);
+			Dictionary<Account, AccountRow> existing = new Dictionary<Account, AccountRow>();
+			foreach (AccountRow row in accountRows)
+				existing[row.State.NinjaAccount] = row;
 
-			panel.Children.Add(new TextBlock
+			Account previouslySelectedMaster = masterCombo.SelectedItem as Account;
+
+			accountRows.Clear();
+			foreach (Account account in connected)
 			{
-				Text = "Follower accounts",
-				FontWeight = FontWeights.Bold,
-				Margin = new Thickness(0, 16, 0, 4)
-			});
+				AccountRow row;
+				if (!existing.TryGetValue(account, out row))
+					row = new AccountRow(new AccountState(account, AccountRole.Follower));
+				accountRows.Add(row);
+			}
 
-			StackPanel headerRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 2) };
-			foreach (string header in new[] { "On", "Account", "Multiplier", "MaxContracts", "DailyRiskBudget", "MaxDrawdown", "DrawdownType", "StartBalance", "FreezeOffset" })
-				headerRow.Children.Add(new TextBlock { Text = header, Width = 95, FontWeight = FontWeights.Bold });
-			panel.Children.Add(headerRow);
+			masterCombo.ItemsSource = connected;
+			if (previouslySelectedMaster != null && connected.Contains(previouslySelectedMaster))
+				masterCombo.SelectedItem = previouslySelectedMaster;
+			else if (connected.Count > 0)
+				masterCombo.SelectedIndex = 0;
 
-			foreach (Account account in allAccounts)
-				panel.Children.Add(BuildFollowerSetupRow(account));
-
-			Button armButton = new Button { Content = "Arm", Width = 120, Height = 30, Margin = new Thickness(0, 16, 0, 0), HorizontalAlignment = HorizontalAlignment.Left };
-			armButton.Click += OnArmClick;
-			panel.Children.Add(armButton);
-
-			panel.Children.Add(new TextBlock
-			{
-				Text = "Leave a limit field empty/0 to disable that check for that account. Master's own risk limits aren't configurable here yet.",
-				Margin = new Thickness(0, 8, 0, 0),
-				Opacity = 0.7,
-				TextWrapping = TextWrapping.Wrap
-			});
-
-			return panel;
+			RecomputeRoles();
 		}
 
-		private StackPanel BuildFollowerSetupRow(Account account)
+		private void OnMasterComboSelectionChanged(object sender, SelectionChangedEventArgs e)
 		{
-			FollowerSetupRow row = new FollowerSetupRow { Account = account };
-
-			StackPanel rowPanel = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 2, 0, 2) };
-
-			row.EnabledCheckBox = new CheckBox { Width = 95, VerticalAlignment = VerticalAlignment.Center };
-			rowPanel.Children.Add(row.EnabledCheckBox);
-
-			rowPanel.Children.Add(new TextBlock { Text = account.Name, Width = 95, VerticalAlignment = VerticalAlignment.Center });
-
-			row.MultiplierBox = new TextBox { Text = "1", Width = 95 };
-			rowPanel.Children.Add(row.MultiplierBox);
-
-			row.MaxContractsBox = new TextBox { Text = "", Width = 95 };
-			rowPanel.Children.Add(row.MaxContractsBox);
-
-			row.DailyRiskBudgetBox = new TextBox { Text = "", Width = 95 };
-			rowPanel.Children.Add(row.DailyRiskBudgetBox);
-
-			row.MaxDrawdownBox = new TextBox { Text = "", Width = 95 };
-			rowPanel.Children.Add(row.MaxDrawdownBox);
-
-			row.DrawdownTypeCombo = new ComboBox { ItemsSource = Enum.GetValues(typeof(DrawdownType)), SelectedIndex = 0, Width = 95 };
-			rowPanel.Children.Add(row.DrawdownTypeCombo);
-
-			row.StartingBalanceBox = new TextBox { Text = "", Width = 95 };
-			rowPanel.Children.Add(row.StartingBalanceBox);
-
-			row.FreezeOffsetBox = new TextBox { Text = "100", Width = 95 };
-			rowPanel.Children.Add(row.FreezeOffsetBox);
-
-			followerSetupRows.Add(row);
-			return rowPanel;
+			RecomputeRoles();
 		}
+
+		private void RecomputeRoles()
+		{
+			Account selected = masterCombo.SelectedItem as Account;
+			foreach (AccountRow row in accountRows)
+				row.State.Role = (selected != null && ReferenceEquals(row.State.NinjaAccount, selected))
+					? AccountRole.Master
+					: AccountRole.Follower;
+
+			followerView.View.Refresh();
+		}
+
+		private AccountRow FindRow(Account account)
+		{
+			foreach (AccountRow row in accountRows)
+				if (ReferenceEquals(row.State.NinjaAccount, account))
+					return row;
+			return null;
+		}
+
+		// ----- Arm / Rearm / Stop / Kill switch -----
 
 		private void OnArmClick(object sender, RoutedEventArgs e)
 		{
@@ -441,166 +468,72 @@ namespace NinjaTrader.Gui.NinjaScript
 				return;
 			}
 
+			AccountRow masterRow = FindRow(selectedMaster);
 			List<AccountState> newFollowers = new List<AccountState>();
-			foreach (FollowerSetupRow row in followerSetupRows)
+			foreach (AccountRow row in accountRows)
 			{
-				if (row.EnabledCheckBox.IsChecked != true)
+				if (ReferenceEquals(row, masterRow))
 					continue;
-
-				if (ReferenceEquals(row.Account, selectedMaster))
-				{
-					MessageBox.Show(this, "An account can't be both master and follower.", "Trade Copier", MessageBoxButton.OK, MessageBoxImage.Warning);
-					return;
-				}
-
-				AccountState followerState = new AccountState(row.Account, AccountRole.Follower);
-				ApplyRowSettings(row, followerState);
-				newFollowers.Add(followerState);
+				if (row.IncludeAsFollower)
+					newFollowers.Add(row.State);
 			}
 
 			if (newFollowers.Count == 0)
 			{
-				MessageBox.Show(this, "Choose at least one follower account.", "Trade Copier", MessageBoxButton.OK, MessageBoxImage.Warning);
+				MessageBox.Show(this, "Check at least one follower account (the On column) first.", "Trade Copier", MessageBoxButton.OK, MessageBoxImage.Warning);
 				return;
 			}
 
-			AccountState masterState = new AccountState(selectedMaster, AccountRole.Master);
-			CopierManager.Start(masterState, newFollowers);
+			ApplyPendingStartingBalance(masterRow);
+			foreach (AccountRow row in accountRows)
+				if (!ReferenceEquals(row, masterRow) && row.IncludeAsFollower)
+					ApplyPendingStartingBalance(row);
+
+			if (CopierManager.IsRunning)
+				CopierManager.Stop();
+
+			masterRow.State.Role = AccountRole.Master;
+			CopierManager.Start(masterRow.State, newFollowers);
+
+			RefreshAllRows();
 		}
 
-		private static void ApplyRowSettings(FollowerSetupRow row, AccountState state)
+		// Only reseeds the trailing high-water-mark/EOD baseline if the
+		// starting balance field actually changed - otherwise a routine
+		// rearm (e.g. just to add one more follower) would silently reset an
+		// already-running account's trailing-drawdown progress.
+		private static void ApplyPendingStartingBalance(AccountRow row)
 		{
-			state.QuantityMultiplier = ParseDecimalOrDefault(row.MultiplierBox.Text, 1m);
-			state.MaxContracts = ParseIntOrDefault(row.MaxContractsBox.Text, int.MaxValue);
-			state.DailyRiskBudget = ParseDecimalOrDefault(row.DailyRiskBudgetBox.Text, 0m);
-			state.MaxDrawdownAmount = ParseDecimalOrDefault(row.MaxDrawdownBox.Text, 0m);
-			state.TrailingStopFreezeOffset = ParseDecimalOrDefault(row.FreezeOffsetBox.Text, 0m);
-			state.DrawdownType = row.DrawdownTypeCombo.SelectedItem is DrawdownType
-				? (DrawdownType)row.DrawdownTypeCombo.SelectedItem
-				: DrawdownType.IntradayTrailing;
-
-			decimal startingBalance = ParseDecimalOrDefault(row.StartingBalanceBox.Text, 0m);
-			state.InitializeBalances(startingBalance);
+			decimal pending;
+			if (decimal.TryParse(row.PendingStartingBalance, out pending) && pending != row.State.StartingBalance)
+				row.State.InitializeBalances(pending);
 		}
 
-		private static decimal ParseDecimalOrDefault(string text, decimal fallback)
+		private void OnStopCopierClick(object sender, RoutedEventArgs e)
 		{
-			decimal value;
-			return decimal.TryParse(text, out value) ? value : fallback;
-		}
+			if (!CopierManager.IsRunning)
+				return;
 
-		private static int ParseIntOrDefault(string text, int fallback)
-		{
-			int value;
-			return int.TryParse(text, out value) ? value : fallback;
-		}
+			MessageBoxResult result = MessageBox.Show(this,
+				"Stop the copier entirely? This does NOT flatten positions - use Kill Switch for that. " +
+				"No further copying, stop-mirroring or risk monitoring will happen until re-armed.",
+				"Stop Copier", MessageBoxButton.YesNo, MessageBoxImage.Warning);
 
-		private void ShowSetupScreen()
-		{
-			setupPanel.Visibility = Visibility.Visible;
-			dashboardPanel.Visibility = Visibility.Collapsed;
-		}
+			if (result != MessageBoxResult.Yes)
+				return;
 
-		// ----- Dashboard screen -----
-
-		private FrameworkElement BuildDashboardPanel()
-		{
-			DockPanel dashboard = new DockPanel { Margin = new Thickness(12), Visibility = Visibility.Collapsed };
-
-			dashboard.Children.Add(BuildMasterSummary());
-			dashboard.Children.Add(BuildLogPanel());
-			dashboard.Children.Add(BuildFollowerGrid());
-
-			return dashboard;
-		}
-
-		private FrameworkElement BuildMasterSummary()
-		{
-			Border border = new Border { BorderBrush = Brushes.Gray, BorderThickness = new Thickness(1), Padding = new Thickness(8), Margin = new Thickness(0, 0, 0, 8) };
-			DockPanel.SetDock(border, Dock.Top);
-
-			StackPanel row = new StackPanel { Orientation = Orientation.Horizontal };
-
-			masterStatusIndicator = new Border { Width = 14, Height = 14, CornerRadius = new CornerRadius(7), Background = Brushes.Gray, Margin = new Thickness(0, 0, 8, 0), VerticalAlignment = VerticalAlignment.Center };
-			row.Children.Add(masterStatusIndicator);
-
-			masterNameText = new TextBlock { FontWeight = FontWeights.Bold, Width = 140, VerticalAlignment = VerticalAlignment.Center };
-			row.Children.Add(masterNameText);
-
-			masterConnectionText = new TextBlock { Width = 100, VerticalAlignment = VerticalAlignment.Center };
-			row.Children.Add(masterConnectionText);
-
-			masterPositionText = new TextBlock { Width = 200, VerticalAlignment = VerticalAlignment.Center };
-			row.Children.Add(masterPositionText);
-
-			masterPnlText = new TextBlock { Width = 200, VerticalAlignment = VerticalAlignment.Center };
-			row.Children.Add(masterPnlText);
-
-			masterStatusText = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
-			row.Children.Add(masterStatusText);
-
-			Button killSwitch = new Button { Content = "KILL SWITCH - Flatten All", Background = Brushes.DarkRed, Foreground = Brushes.White, Padding = new Thickness(8, 4, 8, 4), Margin = new Thickness(16, 0, 8, 0) };
-			killSwitch.Click += OnKillSwitchClick;
-			row.Children.Add(killSwitch);
-
-			Button stopButton = new Button { Content = "Stop Copier", Padding = new Thickness(8, 4, 8, 4) };
-			stopButton.Click += OnStopCopierClick;
-			row.Children.Add(stopButton);
-
-			border.Child = row;
-			return border;
-		}
-
-		private FrameworkElement BuildLogPanel()
-		{
-			Border border = new Border { BorderBrush = Brushes.Gray, BorderThickness = new Thickness(1), Margin = new Thickness(0, 8, 0, 0), Height = 140 };
-			DockPanel.SetDock(border, Dock.Bottom);
-
-			ListBox logBox = new ListBox { ItemsSource = logLines, FontFamily = new FontFamily("Consolas") };
-			border.Child = logBox;
-			return border;
-		}
-
-		private DataGrid BuildFollowerGrid()
-		{
-			DataGrid grid = new DataGrid
-			{
-				ItemsSource = followerRows,
-				AutoGenerateColumns = false,
-				IsReadOnly = true,
-				CanUserAddRows = false
-			};
-
-			grid.Columns.Add(new DataGridTextColumn { Header = "Account", Binding = new Binding("Name") });
-			grid.Columns.Add(new DataGridTextColumn { Header = "Connection", Binding = new Binding("Connection") });
-			grid.Columns.Add(new DataGridTextColumn { Header = "Position", Binding = new Binding("Position") });
-			grid.Columns.Add(new DataGridTextColumn { Header = "Realized PnL", Binding = new Binding("RealizedPnl") });
-			grid.Columns.Add(new DataGridTextColumn { Header = "Unrealized PnL", Binding = new Binding("UnrealizedPnl") });
-			grid.Columns.Add(new DataGridTextColumn { Header = "DRB used/limit", Binding = new Binding("Drb") });
-			grid.Columns.Add(new DataGridTextColumn { Header = "Trailing DD room", Binding = new Binding("TrailingDd") });
-			grid.Columns.Add(new DataGridTextColumn { Header = "Sent/Filled/Rejected", Binding = new Binding("Stats") });
-			grid.Columns.Add(new DataGridTextColumn { Header = "Status", Binding = new Binding("Status") });
-
-			DataGridTemplateColumn statusColumn = new DataGridTemplateColumn { Header = "" };
-			FrameworkElementFactory ellipseFactory = new FrameworkElementFactory(typeof(Ellipse));
-			ellipseFactory.SetValue(Ellipse.WidthProperty, 12.0);
-			ellipseFactory.SetValue(Ellipse.HeightProperty, 12.0);
-			ellipseFactory.SetBinding(Ellipse.FillProperty, new Binding("StatusBrush"));
-			statusColumn.CellTemplate = new DataTemplate { VisualTree = ellipseFactory };
-			grid.Columns.Insert(0, statusColumn);
-
-			DataGridTemplateColumn flattenColumn = new DataGridTemplateColumn { Header = "Flatten" };
-			FrameworkElementFactory buttonFactory = new FrameworkElementFactory(typeof(Button));
-			buttonFactory.SetValue(ContentControl.ContentProperty, "Flatten");
-			buttonFactory.AddHandler(Button.ClickEvent, (RoutedEventHandler)OnRowFlattenClick);
-			flattenColumn.CellTemplate = new DataTemplate { VisualTree = buttonFactory };
-			grid.Columns.Add(flattenColumn);
-
-			return grid;
+			CopierManager.Stop();
+			RefreshAllRows();
 		}
 
 		private void OnKillSwitchClick(object sender, RoutedEventArgs e)
 		{
+			if (!CopierManager.IsRunning)
+			{
+				MessageBox.Show(this, "Nothing is armed yet.", "Trade Copier", MessageBoxButton.OK, MessageBoxImage.Warning);
+				return;
+			}
+
 			MessageBoxResult result = MessageBox.Show(this,
 				"Flatten and lock ALL accounts (master + every follower) right now?",
 				"Kill Switch", MessageBoxButton.YesNo, MessageBoxImage.Warning);
@@ -613,26 +546,20 @@ namespace NinjaTrader.Gui.NinjaScript
 				CopierManager.RiskManager.ManualFlatten(follower, "Kill switch");
 		}
 
-		private void OnStopCopierClick(object sender, RoutedEventArgs e)
-		{
-			MessageBoxResult result = MessageBox.Show(this,
-				"Stop the copier entirely? This does NOT flatten positions - use Kill Switch for that. " +
-				"No further copying, stop-mirroring or risk monitoring will happen until re-armed.",
-				"Stop Copier", MessageBoxButton.YesNo, MessageBoxImage.Warning);
-
-			if (result != MessageBoxResult.Yes)
-				return;
-
-			CopierManager.Stop();
-			ShowSetupScreen();
-		}
-
 		private void OnRowFlattenClick(object sender, RoutedEventArgs e)
 		{
 			FrameworkElement element = sender as FrameworkElement;
-			FollowerRow row = element != null ? element.DataContext as FollowerRow : null;
+			AccountRow row = element != null ? element.DataContext as AccountRow : null;
 			if (row == null)
 				return;
+
+			bool tracked = CopierManager.IsRunning
+				&& (ReferenceEquals(row.State, CopierManager.Master) || CopierManager.Followers.Contains(row.State));
+			if (!tracked)
+			{
+				MessageBox.Show(this, "This account isn't armed yet.", "Trade Copier", MessageBoxButton.OK, MessageBoxImage.Warning);
+				return;
+			}
 
 			MessageBoxResult result = MessageBox.Show(this,
 				string.Format("Flatten {0} now? This does not lock the account.", row.Name),
@@ -644,59 +571,295 @@ namespace NinjaTrader.Gui.NinjaScript
 			CopierManager.Engine.FlattenAccount(row.State, "Manual flatten (dashboard button)");
 		}
 
-		// ----- Refresh -----
+		// ----- Tab 1: Trade Copier -----
 
-		private void RefreshDashboard()
+		private FrameworkElement BuildTab1()
 		{
-			if (!CopierManager.IsRunning)
-				return;
+			DockPanel root = new DockPanel { Background = ThemeBackground, Margin = new Thickness(8) };
 
-			RefreshMasterSummary();
-			foreach (FollowerRow row in followerRows)
-				RefreshFollowerRow(row);
+			Border topBar = BuildTopBar();
+			DockPanel.SetDock(topBar, Dock.Top);
+			root.Children.Add(topBar);
+
+			DataGrid grid = BuildThemedDataGrid();
+			grid.ItemsSource = followerView.View;
+
+			grid.Columns.Add(new DataGridCheckBoxColumn { Header = "On", Binding = new Binding("IncludeAsFollower") { Mode = BindingMode.TwoWay } });
+			grid.Columns.Add(new DataGridTextColumn { Header = "Account", Binding = new Binding("Name"), IsReadOnly = true });
+
+			DataGridTextColumn multiplierColumn = new DataGridTextColumn { Header = "Multiplier", Binding = new Binding("Multiplier") { Mode = BindingMode.TwoWay } };
+			multiplierColumn.EditingElementStyle = BuildEditingTextBoxStyle();
+			grid.Columns.Add(multiplierColumn);
+
+			grid.Columns.Add(new DataGridTextColumn { Header = "Position", Binding = new Binding("Position"), IsReadOnly = true });
+			grid.Columns.Add(BuildColoredTextColumn("Realized PnL", "RealizedPnl", "RealizedPnlBrush"));
+			grid.Columns.Add(BuildColoredTextColumn("Unrealized PnL", "UnrealizedPnl", "UnrealizedPnlBrush"));
+			grid.Columns.Add(BuildColoredTextColumn("Status", "Status", "StatusBrush"));
+			grid.Columns.Add(BuildFlattenColumn());
+
+			root.Children.Add(grid);
+			return root;
 		}
 
-		private void RefreshMasterSummary()
+		private Border BuildTopBar()
 		{
-			AccountState state = CopierManager.Master;
+			Border border = new Border
+			{
+				Background = ThemePanelBackground,
+				BorderBrush = ThemeBorder,
+				BorderThickness = new Thickness(1),
+				Padding = new Thickness(8),
+				Margin = new Thickness(0, 0, 0, 8)
+			};
+
+			StackPanel row = new StackPanel { Orientation = Orientation.Horizontal };
+
+			row.Children.Add(new TextBlock { Text = "Master:", Foreground = ThemeForeground, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 6, 0) });
+
+			masterCombo = new ComboBox { DisplayMemberPath = "Name", Width = 160, Margin = new Thickness(0, 0, 12, 0) };
+			masterCombo.SelectionChanged += OnMasterComboSelectionChanged;
+			row.Children.Add(masterCombo);
+
+			Button refreshButton = new Button { Content = "Refresh Accounts", Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(0, 0, 12, 0) };
+			refreshButton.Click += (s, e) => { RebuildAccountRows(); RefreshAllRows(); };
+			row.Children.Add(refreshButton);
+
+			armButton = new Button { Content = "Arm", Width = 90, Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(0, 0, 12, 0) };
+			armButton.Click += OnArmClick;
+			row.Children.Add(armButton);
+
+			masterStatusIndicator = new Border { Width = 14, Height = 14, CornerRadius = new CornerRadius(7), Background = Brushes.Gray, Margin = new Thickness(0, 0, 6, 0), VerticalAlignment = VerticalAlignment.Center };
+			row.Children.Add(masterStatusIndicator);
+
+			masterSummaryText = new TextBlock { Foreground = ThemeForeground, VerticalAlignment = VerticalAlignment.Center, Width = 460, TextTrimming = TextTrimming.CharacterEllipsis };
+			row.Children.Add(masterSummaryText);
+
+			Button killSwitch = new Button { Content = "KILL SWITCH - Flatten All", Background = Brushes.DarkRed, Foreground = Brushes.White, Padding = new Thickness(10, 4, 10, 4), Margin = new Thickness(12, 0, 6, 0) };
+			killSwitch.Click += OnKillSwitchClick;
+			row.Children.Add(killSwitch);
+
+			Button stopButton = new Button { Content = "Stop Copier", Padding = new Thickness(8, 4, 8, 4) };
+			stopButton.Click += OnStopCopierClick;
+			row.Children.Add(stopButton);
+
+			border.Child = row;
+			return border;
+		}
+
+		// ----- Tab 2: Risk Monitor & Settings -----
+
+		private FrameworkElement BuildTab2()
+		{
+			DockPanel root = new DockPanel { Background = ThemeBackground, Margin = new Thickness(8) };
+
+			DataGrid grid = BuildThemedDataGrid();
+			grid.ItemsSource = accountRows;
+
+			grid.Columns.Add(new DataGridTextColumn { Header = "Account", Binding = new Binding("Name"), IsReadOnly = true });
+			grid.Columns.Add(new DataGridTextColumn { Header = "Net Liquidation", Binding = new Binding("NetLiquidation"), IsReadOnly = true });
+			grid.Columns.Add(new DataGridTextColumn { Header = "Auto Liquidate", Binding = new Binding("AutoLiquidateFloor"), IsReadOnly = true });
+			grid.Columns.Add(BuildColoredTextColumn("Distance to Auto", "DistanceToAuto", "DistanceToAutoBrush"));
+
+			DataGridTextColumn drbColumn = new DataGridTextColumn { Header = "Daily Risk Budget", Binding = new Binding("DailyRiskBudget") { Mode = BindingMode.TwoWay } };
+			drbColumn.EditingElementStyle = BuildEditingTextBoxStyle();
+			grid.Columns.Add(drbColumn);
+
+			DataGridTextColumn maxDdColumn = new DataGridTextColumn { Header = "Max Drawdown", Binding = new Binding("MaxDrawdown") { Mode = BindingMode.TwoWay } };
+			maxDdColumn.EditingElementStyle = BuildEditingTextBoxStyle();
+			grid.Columns.Add(maxDdColumn);
+
+			grid.Columns.Add(new DataGridComboBoxColumn
+			{
+				Header = "Drawdown Type",
+				ItemsSource = Enum.GetValues(typeof(DrawdownType)),
+				SelectedItemBinding = new Binding("DrawdownTypeValue") { Mode = BindingMode.TwoWay }
+			});
+
+			// Starting Balance isn't in the original column list but is
+			// required for the drawdown floor math (freeze level = starting
+			// balance + freeze offset) - added so the Risk Monitor tab can
+			// actually configure a working account instead of leaving this
+			// unreachable.
+			DataGridTextColumn startBalColumn = new DataGridTextColumn { Header = "Starting Balance", Binding = new Binding("PendingStartingBalance") { Mode = BindingMode.TwoWay } };
+			startBalColumn.EditingElementStyle = BuildEditingTextBoxStyle();
+			grid.Columns.Add(startBalColumn);
+
+			DataGridTextColumn freezeColumn = new DataGridTextColumn { Header = "Freeze Offset", Binding = new Binding("FreezeOffset") { Mode = BindingMode.TwoWay } };
+			freezeColumn.EditingElementStyle = BuildEditingTextBoxStyle();
+			grid.Columns.Add(freezeColumn);
+
+			root.Children.Add(grid);
+			return root;
+		}
+
+		// ----- Themed WPF building blocks -----
+
+		private DataGrid BuildThemedDataGrid()
+		{
+			DataGrid grid = new DataGrid
+			{
+				AutoGenerateColumns = false,
+				CanUserAddRows = false,
+				HeadersVisibility = DataGridHeadersVisibility.Column,
+				GridLinesVisibility = DataGridGridLinesVisibility.Horizontal,
+				Background = ThemeBackground,
+				Foreground = ThemeForeground,
+				RowBackground = ThemeRowBackground,
+				AlternatingRowBackground = ThemeRowAltBackground,
+				BorderBrush = ThemeBorder,
+				BorderThickness = new Thickness(1),
+				HorizontalGridLinesBrush = ThemeBorder,
+				VerticalGridLinesBrush = ThemeBorder,
+				RowHeaderWidth = 0
+			};
+
+			Style cellStyle = new Style(typeof(DataGridCell));
+			cellStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
+			cellStyle.Setters.Add(new Setter(Control.ForegroundProperty, ThemeForeground));
+			cellStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0)));
+			cellStyle.Setters.Add(new Setter(FrameworkElement.FocusVisualStyleProperty, null));
+			grid.CellStyle = cellStyle;
+
+			Style headerStyle = new Style(typeof(DataGridColumnHeader));
+			headerStyle.Setters.Add(new Setter(Control.BackgroundProperty, ThemeHeaderBackground));
+			headerStyle.Setters.Add(new Setter(Control.ForegroundProperty, ThemeForeground));
+			headerStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(6, 4, 6, 4)));
+			headerStyle.Setters.Add(new Setter(Control.BorderBrushProperty, ThemeBorder));
+			grid.ColumnHeaderStyle = headerStyle;
+
+			Style rowStyle = new Style(typeof(DataGridRow));
+			rowStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
+			grid.RowStyle = rowStyle;
+
+			return grid;
+		}
+
+		private static Style BuildEditingTextBoxStyle()
+		{
+			Style style = new Style(typeof(TextBox));
+			style.Setters.Add(new Setter(Control.BackgroundProperty, ThemeRowBackground));
+			style.Setters.Add(new Setter(Control.ForegroundProperty, ThemeForeground));
+			style.Setters.Add(new Setter(Control.BorderBrushProperty, ThemeBorder));
+			return style;
+		}
+
+		private static DataGridTemplateColumn BuildColoredTextColumn(string header, string textPath, string brushPath)
+		{
+			FrameworkElementFactory textFactory = new FrameworkElementFactory(typeof(TextBlock));
+			textFactory.SetBinding(TextBlock.TextProperty, new Binding(textPath));
+			textFactory.SetBinding(TextBlock.ForegroundProperty, new Binding(brushPath));
+			textFactory.SetValue(FrameworkElement.MarginProperty, new Thickness(6, 0, 6, 0));
+			textFactory.SetValue(TextBlock.VerticalAlignmentProperty, VerticalAlignment.Center);
+
+			return new DataGridTemplateColumn { Header = header, CellTemplate = new DataTemplate { VisualTree = textFactory } };
+		}
+
+		private DataGridTemplateColumn BuildFlattenColumn()
+		{
+			FrameworkElementFactory buttonFactory = new FrameworkElementFactory(typeof(Button));
+			buttonFactory.SetValue(ContentControl.ContentProperty, "Flatten");
+			buttonFactory.SetValue(Control.PaddingProperty, new Thickness(6, 2, 6, 2));
+			buttonFactory.AddHandler(Button.ClickEvent, (RoutedEventHandler)OnRowFlattenClick);
+
+			return new DataGridTemplateColumn { Header = "Flatten", CellTemplate = new DataTemplate { VisualTree = buttonFactory } };
+		}
+
+		// ----- Refresh -----
+
+		private void RefreshAllRows()
+		{
+			SyncLogSubscription();
+			UpdateTopBar();
+
+			foreach (AccountRow row in accountRows)
+				RefreshRow(row);
+		}
+
+		private void SyncLogSubscription()
+		{
+			if (ReferenceEquals(subscribedEngine, CopierManager.Engine))
+				return;
+
+			if (subscribedEngine != null)
+				subscribedEngine.LogMessage -= OnEngineLogMessage;
+
+			subscribedEngine = CopierManager.Engine;
+
+			if (subscribedEngine != null)
+				subscribedEngine.LogMessage += OnEngineLogMessage;
+		}
+
+		private void UpdateTopBar()
+		{
+			armButton.Content = CopierManager.IsRunning ? "Rearm" : "Arm";
+
+			if (!CopierManager.IsRunning)
+			{
+				masterSummaryText.Text = "Not armed yet - choose a master, check followers on the On column, click Arm.";
+				masterStatusIndicator.Background = Brushes.Gray;
+				return;
+			}
+
+			AccountState masterState = CopierManager.Master;
+			decimal equity = CopierManager.RiskManager.GetLiveEquity(masterState);
+
+			masterSummaryText.Text = string.Format("{0}  |  {1}  |  Realized {2:C}  Unrealized {3:C}",
+				masterState.DisplayName, CopierManager.Engine.DescribePosition(masterState),
+				masterState.DailyRealizedPnL, masterState.DailyUnrealizedPnL);
+
+			if (masterState.IsLocked)
+				masterStatusIndicator.Background = Brushes.OrangeRed;
+			else if (IsNearLimit(masterState, equity))
+				masterStatusIndicator.Background = Brushes.Gold;
+			else
+				masterStatusIndicator.Background = Brushes.LimeGreen;
+		}
+
+		private void RefreshRow(AccountRow row)
+		{
+			AccountState state = row.State;
+			bool tracked = CopierManager.IsRunning
+				&& (ReferenceEquals(state, CopierManager.Master) || CopierManager.Followers.Contains(state));
+
+			if (!tracked)
+			{
+				row.Position = "-";
+				row.RealizedPnl = "-";
+				row.RealizedPnlBrush = ThemeForeground;
+				row.UnrealizedPnl = "-";
+				row.UnrealizedPnlBrush = ThemeForeground;
+				row.Status = "Not armed";
+				row.StatusBrush = Brushes.Gray;
+				row.NetLiquidation = "-";
+				row.AutoLiquidateFloor = "-";
+				row.DistanceToAuto = "-";
+				row.DistanceToAutoBrush = ThemeForeground;
+				return;
+			}
+
 			decimal equity = CopierManager.RiskManager.GetLiveEquity(state);
 
-			masterNameText.Text = "MASTER: " + state.DisplayName;
-			masterConnectionText.Text = DescribeConnection(state);
-			masterPositionText.Text = CopierManager.Engine.DescribePosition(state);
-			masterPnlText.Text = string.Format("Realized {0:C}  Unrealized {1:C}", state.DailyRealizedPnL, state.DailyUnrealizedPnL);
+			row.Position = CopierManager.Engine.DescribePosition(state);
+			row.RealizedPnl = state.DailyRealizedPnL.ToString("C");
+			row.RealizedPnlBrush = PnlBrush(state.DailyRealizedPnL);
+			row.UnrealizedPnl = state.DailyUnrealizedPnL.ToString("C");
+			row.UnrealizedPnlBrush = PnlBrush(state.DailyUnrealizedPnL);
 
-			if (state.IsLocked)
+			row.NetLiquidation = equity.ToString("C");
+
+			if (state.MaxDrawdownAmount > 0)
 			{
-				masterStatusText.Text = "LOCKED: " + state.LockReason;
-				masterStatusIndicator.Background = Brushes.OrangeRed;
-			}
-			else if (IsNearLimit(state, equity))
-			{
-				masterStatusText.Text = "Warning";
-				masterStatusIndicator.Background = Brushes.Gold;
+				row.AutoLiquidateFloor = state.DrawdownFloor.ToString("C");
+				decimal distance = equity - state.DrawdownFloor;
+				row.DistanceToAuto = distance.ToString("C");
+				row.DistanceToAutoBrush = DistanceBrush(distance);
 			}
 			else
 			{
-				masterStatusText.Text = "OK";
-				masterStatusIndicator.Background = Brushes.LimeGreen;
+				row.AutoLiquidateFloor = "off";
+				row.DistanceToAuto = "off";
+				row.DistanceToAutoBrush = ThemeForeground;
 			}
-		}
-
-		private void RefreshFollowerRow(FollowerRow row)
-		{
-			AccountState state = row.State;
-			decimal equity = CopierManager.RiskManager.GetLiveEquity(state);
-
-			row.Connection = DescribeConnection(state);
-			row.Position = CopierManager.Engine.DescribePosition(state);
-			row.RealizedPnl = state.DailyRealizedPnL.ToString("C");
-			row.UnrealizedPnl = state.DailyUnrealizedPnL.ToString("C");
-			row.Stats = string.Format("{0}/{1}/{2}", state.OrdersSent, state.OrdersFilled, state.OrdersRejected);
-
-			decimal drbUsed = state.DailyPnL < 0 ? -state.DailyPnL : 0m;
-			row.Drb = state.DailyRiskBudget > 0 ? string.Format("{0:C} / {1:C}", drbUsed, state.DailyRiskBudget) : "off";
-			row.TrailingDd = state.MaxDrawdownAmount > 0 ? (equity - state.DrawdownFloor).ToString("C") : "off";
 
 			if (state.IsLocked)
 			{
@@ -715,6 +878,20 @@ namespace NinjaTrader.Gui.NinjaScript
 			}
 		}
 
+		private static Brush PnlBrush(decimal value)
+		{
+			if (value > 0) return Brushes.LimeGreen;
+			if (value < 0) return Brushes.Red;
+			return ThemeForeground;
+		}
+
+		private static Brush DistanceBrush(decimal distance)
+		{
+			if (distance < DistanceDangerDollars) return Brushes.Red;
+			if (distance < DistanceWarningDollars) return Brushes.Orange;
+			return Brushes.LimeGreen;
+		}
+
 		private static bool IsNearLimit(AccountState state, decimal equity)
 		{
 			if (state.MaxDrawdownAmount > 0 && (equity - state.DrawdownFloor) <= state.MaxDrawdownAmount * WarningThresholdFraction)
@@ -728,22 +905,6 @@ namespace NinjaTrader.Gui.NinjaScript
 			}
 
 			return false;
-		}
-
-		// NOTE: verify Account.Connection/.Status against the NinjaScript
-		// Editor - defensively caught so a display-only mistake here can't
-		// take the whole dashboard down.
-		private static string DescribeConnection(AccountState state)
-		{
-			try
-			{
-				Connection connection = state.NinjaAccount.Connection;
-				return connection != null ? connection.Status.ToString() : "None";
-			}
-			catch (Exception)
-			{
-				return "Unknown";
-			}
 		}
 	}
 }
