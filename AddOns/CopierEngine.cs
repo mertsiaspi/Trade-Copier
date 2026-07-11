@@ -604,6 +604,24 @@ namespace NinjaTrader.NinjaScript.AddOns
 			return true;
 		}
 
+		// Read-only summary for the dashboard, e.g. "MYM +2, MES -1" or "Flat".
+		public string DescribePosition(AccountState state)
+		{
+			lock (engineLock)
+			{
+				Dictionary<Instrument, int> map = GetPositionMap(state);
+				List<string> parts = new List<string>();
+				foreach (KeyValuePair<Instrument, int> position in map)
+				{
+					if (position.Value == 0)
+						continue;
+					parts.Add(string.Format("{0} {1}{2}", position.Key.FullName,
+						position.Value > 0 ? "+" : "", position.Value));
+				}
+				return parts.Count == 0 ? "Flat" : string.Join(", ", parts);
+			}
+		}
+
 		// The single place in the project that calls Account.CreateOrder/Submit.
 		// NOTE: verify Account.CreateOrder's exact parameter order against the
 		// NinjaScript Editor - a wrong same-typed parameter (e.g. limitPrice

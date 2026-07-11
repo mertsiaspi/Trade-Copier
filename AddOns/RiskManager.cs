@@ -137,7 +137,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 		// NinjaScript Editor. AccountItem.NetLiquidation / Currency.UsDollar
 		// are the standard NT8 members for "cash + open P&L", but please
 		// confirm on compile before this runs against a funded account.
-		private decimal GetLiveEquity(AccountState state)
+		// Public so CopierWindow can show the same live equity figure on the
+		// dashboard instead of re-implementing this call a second time.
+		public decimal GetLiveEquity(AccountState state)
 		{
 			double netLiquidation = state.NinjaAccount.Get(AccountItem.NetLiquidation, Currency.UsDollar);
 			return (decimal)netLiquidation;
