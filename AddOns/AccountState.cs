@@ -70,8 +70,23 @@ namespace NinjaTrader.NinjaScript.AddOns
 			get { return DailyRealizedPnL + DailyUnrealizedPnL; }
 		}
 
+		// Total open contracts across ALL instruments on this account (direction-
+		// agnostic sum of absolute per-instrument positions) - a rollup for the
+		// dashboard. CopierEngine tracks the real per-instrument signed
+		// breakdown itself (needed since master can hold MYM and MES at once);
+		// this field and PositionDirection below are a simplified summary only.
 		public int NetPositionQuantity { get; set; }
+
+		// Only fully meaningful when a single instrument is open - reflects
+		// whichever instrument's position was updated most recently. For a
+		// precise multi-instrument view, read CopierEngine's per-instrument map.
 		public MarketPosition PositionDirection { get; set; } = MarketPosition.Flat;
+
+		// Fractional contracts "owed" to this follower from previous rounding
+		// when QuantityMultiplier isn't a whole number, so partial fills (and
+		// multiple small fills) sum to the correct total instead of losing
+		// remainders through repeated floor-rounding. Maintained by CopierEngine.
+		public decimal CopyQuantityCarry { get; set; }
 
 		public bool IsLocked { get; private set; }
 		public string LockReason { get; private set; }
