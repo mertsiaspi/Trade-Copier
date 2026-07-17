@@ -86,11 +86,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 		{
 			master.NinjaAccount.ExecutionUpdate += OnMasterExecutionUpdate;
 			master.NinjaAccount.OrderUpdate += OnMasterOrderUpdate;
+			master.NinjaAccount.AccountItemUpdate += OnAccountItemUpdate;
 
 			foreach (AccountState follower in followers)
 			{
 				follower.NinjaAccount.ExecutionUpdate += OnFollowerExecutionUpdate;
 				follower.NinjaAccount.OrderUpdate += OnFollowerOrderUpdate;
+				follower.NinjaAccount.AccountItemUpdate += OnAccountItemUpdate;
 			}
 
 			lock (engineLock)
@@ -99,17 +101,23 @@ namespace NinjaTrader.NinjaScript.AddOns
 				foreach (AccountState follower in followers)
 					SeedAccountPositions(follower);
 			}
+
+			SeedAccountPnl(master);
+			foreach (AccountState follower in followers)
+				SeedAccountPnl(follower);
 		}
 
 		public void Stop()
 		{
 			master.NinjaAccount.ExecutionUpdate -= OnMasterExecutionUpdate;
 			master.NinjaAccount.OrderUpdate -= OnMasterOrderUpdate;
+			master.NinjaAccount.AccountItemUpdate -= OnAccountItemUpdate;
 
 			foreach (AccountState follower in followers)
 			{
 				follower.NinjaAccount.ExecutionUpdate -= OnFollowerExecutionUpdate;
 				follower.NinjaAccount.OrderUpdate -= OnFollowerOrderUpdate;
+				follower.NinjaAccount.AccountItemUpdate -= OnAccountItemUpdate;
 			}
 
 			lock (engineLock)
@@ -330,6 +338,43 @@ namespace NinjaTrader.NinjaScript.AddOns
 			else if (order.OrderState == OrderState.Filled)
 			{
 				follower.IncrementOrdersFilled();
+			}
+		}
+
+		// NOTE: AccountItem.RealizedProfitLoss is reported by NinjaTrader
+		// already reset to 0 at midnight Central Time, so it can be assigned
+		// straight to DailyRealizedPnL - no separate baseline/subtraction
+		// needed here. UnrealizedProfitLoss is inherently a live snapshot
+		// (mark-to-market of the open position), not cumulative, so the same
+		// direct assignment applies.
+		private void OnAccountItemUpdate(object sender, AccountItemEventArgs e)
+		{
+			Account account = sender as Account;
+			if (account == null)
+				return;
+
+			AccountState state = FindTrackedAccount(account);
+			if (state == null)
+				return;
+
+			if (e.AccountItem == AccountItem.RealizedProfitLoss)
+				state.DailyRealizedPnL = (decimal)e.Value;
+			else if (e.AccountItem == AccountItem.UnrealizedProfitLoss)
+				state.DailyUnrealizedPnL = (decimal)e.Value;
+		}
+
+		// Reads the current values once at Start() so the dashboard doesn't
+		// sit at 0/0 until the next actual account item change comes in.
+		private void SeedAccountPnl(AccountState state)
+		{
+			try
+			{
+				state.DailyRealizedPnL = (decimal)state.NinjaAccount.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
+				state.DailyUnrealizedPnL = (decimal)state.NinjaAccount.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
+			}
+			catch (Exception ex)
+			{
+				RaiseLog(LogSeverity.Warning, string.Format("{0}: could not seed starting PnL - {1}", state.DisplayName, ex.Message));
 			}
 		}
 
@@ -587,6 +632,15 @@ namespace NinjaTrader.NinjaScript.AddOns
 				if (ReferenceEquals(follower.NinjaAccount, account))
 					return follower;
 			return null;
+		}
+
+		// Like FindFollower, but also matches master - used by the account
+		// item (PnL) handler, which fires for master too.
+		private AccountState FindTrackedAccount(Account account)
+		{
+			if (ReferenceEquals(master.NinjaAccount, account))
+				return master;
+			return FindFollower(account);
 		}
 
 		// Must be called while holding engineLock.

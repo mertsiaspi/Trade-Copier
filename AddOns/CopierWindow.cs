@@ -34,6 +34,26 @@ namespace NinjaTrader.Gui.NinjaScript
 		private static int reconciliationTickCounter;
 		private const int ReconciliationEveryNTicks = 5; // ~5s at a 1s tick, per CLAUDE.md's suggested interval
 
+		// NinjaTrader itself resets AccountItem.RealizedProfitLoss at
+		// midnight Central Time (confirmed via NinjaTrader support forum),
+		// so daily counters/locks/EOD-drawdown-baseline are rolled over on
+		// the same boundary for consistency. If your prop firm's own "daily"
+		// cutoff is defined differently, this needs to change.
+		private static DateTime lastRolloverDate = GetCentralTimeDate();
+
+		private static DateTime GetCentralTimeDate()
+		{
+			try
+			{
+				TimeZoneInfo centralZone = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
+				return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, centralZone).Date;
+			}
+			catch (Exception)
+			{
+				return DateTime.UtcNow.Date;
+			}
+		}
+
 		public static AccountState Master { get; private set; }
 		public static List<AccountState> Followers { get; private set; }
 		public static RiskManager RiskManager { get; private set; }
@@ -47,6 +67,13 @@ namespace NinjaTrader.Gui.NinjaScript
 		{
 			if (IsRunning)
 				throw new InvalidOperationException("Copier is already running - stop it first.");
+
+			// Baseline "today" against the moment tracking actually starts,
+			// not whenever this type happened to load - otherwise arming on
+			// a later calendar day than that would immediately trigger a
+			// spurious rollover and wipe the PnL CopierEngine.Start() just
+			// seeded from the account.
+			lastRolloverDate = GetCentralTimeDate();
 
 			Master = master;
 			Followers = new List<AccountState>(followers);
@@ -88,6 +115,15 @@ namespace NinjaTrader.Gui.NinjaScript
 
 		private static void OnTimerTick(object sender, EventArgs e)
 		{
+			DateTime today = GetCentralTimeDate();
+			if (today != lastRolloverDate)
+			{
+				lastRolloverDate = today;
+				RiskManager.RolloverToNewTradingDay(Master, RiskManager.GetLiveEquity(Master));
+				foreach (AccountState follower in Followers)
+					RiskManager.RolloverToNewTradingDay(follower, RiskManager.GetLiveEquity(follower));
+			}
+
 			RiskManager.Evaluate(Master);
 			foreach (AccountState follower in Followers)
 				RiskManager.Evaluate(follower);
