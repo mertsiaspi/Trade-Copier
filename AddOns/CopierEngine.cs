@@ -168,42 +168,56 @@ namespace NinjaTrader.NinjaScript.AddOns
 				if (follower.IsLocked)
 					continue;
 
-				List<Tuple<Instrument, int>> corrections = new List<Tuple<Instrument, int>>();
-
-				lock (engineLock)
+				// This was the reported critical bug: an uncaught exception
+				// for one follower used to abort the whole foreach, silently
+				// leaving every subsequent follower unreconciled - possibly
+				// forever, if the same exception recurred every cycle. Each
+				// follower is now fully isolated.
+				try
 				{
-					HashSet<Instrument> instruments = new HashSet<Instrument>(GetPositionMap(master).Keys);
-					foreach (Instrument instrument in GetPositionMap(follower).Keys)
-						instruments.Add(instrument);
+					List<Tuple<Instrument, int>> corrections = new List<Tuple<Instrument, int>>();
 
-					foreach (Instrument instrument in instruments)
+					lock (engineLock)
 					{
-						int masterQty = GetPosition(master, instrument);
-						int followerQty = GetPosition(follower, instrument);
-						int targetQty = (int)Math.Round(masterQty * follower.QuantityMultiplier, MidpointRounding.AwayFromZero);
-						int delta = targetQty - followerQty;
+						HashSet<Instrument> instruments = new HashSet<Instrument>(GetPositionMap(master).Keys);
+						foreach (Instrument instrument in GetPositionMap(follower).Keys)
+							instruments.Add(instrument);
 
-						if (delta == 0)
-							continue;
+						foreach (Instrument instrument in instruments)
+						{
+							int masterQty = GetPosition(master, instrument);
+							int followerQty = GetPosition(follower, instrument);
+							int targetQty = (int)Math.Round(masterQty * follower.QuantityMultiplier, MidpointRounding.AwayFromZero);
+							int delta = targetQty - followerQty;
 
-						RaiseLog(LogSeverity.Warning, string.Format(
-							"{0}: reconciliation mismatch on {1} - master implies {2}, follower has {3} (delta {4}).",
-							follower.DisplayName, instrument.FullName, targetQty, followerQty, delta));
+							if (delta == 0)
+								continue;
 
-						if (AutoCorrectReconciliation)
-							corrections.Add(new Tuple<Instrument, int>(instrument, delta));
+							RaiseLog(LogSeverity.Warning, string.Format(
+								"{0}: reconciliation mismatch on {1} - master implies {2}, follower has {3} (delta {4}).",
+								follower.DisplayName, instrument.FullName, targetQty, followerQty, delta));
+
+							if (AutoCorrectReconciliation)
+								corrections.Add(new Tuple<Instrument, int>(instrument, delta));
+						}
+					}
+
+					foreach (Tuple<Instrument, int> correction in corrections)
+					{
+						// NOTE: uses the plain Buy/Sell pair, not SellShort/BuyToCover -
+						// verify this is the right action pair for how your follower
+						// accounts are configured (futures accounts are usually fine
+						// with Buy/Sell for both opening and closing).
+						OrderAction action = correction.Item2 > 0 ? OrderAction.Buy : OrderAction.Sell;
+						SubmitOrder(follower, correction.Item1, action, OrderType.Market, Math.Abs(correction.Item2), 0, 0,
+							"Reconcile-" + follower.DisplayName);
 					}
 				}
-
-				foreach (Tuple<Instrument, int> correction in corrections)
+				catch (Exception ex)
 				{
-					// NOTE: uses the plain Buy/Sell pair, not SellShort/BuyToCover -
-					// verify this is the right action pair for how your follower
-					// accounts are configured (futures accounts are usually fine
-					// with Buy/Sell for both opening and closing).
-					OrderAction action = correction.Item2 > 0 ? OrderAction.Buy : OrderAction.Sell;
-					SubmitOrder(follower, correction.Item1, action, OrderType.Market, Math.Abs(correction.Item2), 0, 0,
-						"Reconcile-" + follower.DisplayName);
+					RaiseLog(LogSeverity.Error, string.Format(
+						"{0}: reconciliation failed - {1}. Other accounts are still processed; will retry next cycle.",
+						follower.DisplayName, ex.Message));
 				}
 			}
 		}
@@ -214,7 +228,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (execution == null)
 				return;
 
-			Order masterOrder;
 			bool isReCopyOfMirroredStop;
 
 			lock (engineLock)
@@ -224,8 +237,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 
 				UpdatePositionFromExecution(master, execution);
 
-				masterOrder = execution.Order;
-
+				Order masterOrder = execution.Order;
 				Order trackedStop;
 				isReCopyOfMirroredStop = masterOrder != null
 					&& masterStopByInstrument.TryGetValue(execution.Instrument, out trackedStop)
@@ -235,24 +247,22 @@ namespace NinjaTrader.NinjaScript.AddOns
 					masterStopByInstrument.Remove(execution.Instrument);
 			}
 
-			if (masterOrder == null)
-			{
-				RaiseLog(LogSeverity.Warning, string.Format(
-					"{0}: execution {1} has no Order reference - cannot determine the exact action, skipping copy. " +
-					"Reconciliation will flag any resulting drift.",
-					master.DisplayName, execution.ExecutionId));
-				return;
-			}
-
 			if (isReCopyOfMirroredStop)
 			{
 				RaiseLog(LogSeverity.Info, string.Format(
 					"{0}: master stop filled on {1} ({2} x{3}) - follower stops fill on their own, not re-copying.",
-					master.DisplayName, execution.Instrument.FullName, masterOrder.OrderAction, execution.Quantity));
+					master.DisplayName, execution.Instrument.FullName, execution.MarketPosition, execution.Quantity));
 				return;
 			}
 
-			CopyExecutionToFollowers(execution, masterOrder);
+			// Deliberately NOT gated on execution.Order being non-null anymore
+			// (it was originally, and that was the real bug: some fills -
+			// e.g. profit-target/ATM-style exits - report a null Order, which
+			// meant this whole copy was skipped and silently left to a
+			// reconciliation cycle up to ReconciliationEveryNTicks away to
+			// catch. The direction only needs execution.MarketPosition, which
+			// is always populated.
+			CopyExecutionToFollowers(execution);
 			SyncFollowerStops(execution.Instrument);
 		}
 
@@ -378,48 +388,80 @@ namespace NinjaTrader.NinjaScript.AddOns
 			}
 		}
 
-		private void CopyExecutionToFollowers(Execution execution, Order masterOrder)
+		// Uses execution.MarketPosition (always populated) to get a signed
+		// position delta rather than replaying masterOrder.OrderAction - this
+		// works even when execution.Order is null (documented to happen for
+		// some fills, e.g. ATM/profit-target style exits), which used to mean
+		// the whole copy was skipped and left entirely to the next
+		// reconciliation cycle.
+		private void CopyExecutionToFollowers(Execution execution)
 		{
-			bool isIncreasing = masterOrder.OrderAction == OrderAction.Buy || masterOrder.OrderAction == OrderAction.SellShort;
+			int masterSignedDelta = execution.MarketPosition == MarketPosition.Long ? execution.Quantity
+				: execution.MarketPosition == MarketPosition.Short ? -execution.Quantity
+				: 0;
+
+			if (masterSignedDelta == 0)
+				return;
 
 			foreach (AccountState follower in followers)
 			{
 				if (follower.IsLocked)
 				{
 					RaiseLog(LogSeverity.Warning, string.Format(
-						"{0}: skipped copy of {1} x{2} on {3} - account is locked.",
-						follower.DisplayName, masterOrder.OrderAction, execution.Quantity, execution.Instrument.FullName));
+						"{0}: skipped copy on {1} (master delta {2}{3}) - account is locked.",
+						follower.DisplayName, execution.Instrument.FullName, masterSignedDelta > 0 ? "+" : "", masterSignedDelta));
 					continue;
 				}
 
-				int quantity;
-				lock (engineLock)
+				// One follower's failure must never stop the rest from being
+				// processed - this was the second bug: an uncaught exception
+				// here (or in reconciliation/stop-sync below) silently
+				// aborted the loop partway through the follower list.
+				try
 				{
-					quantity = ComputeFollowerCopyQuantity(follower, execution.Quantity, isIncreasing);
+					int signedDeltaToSend;
+					lock (engineLock)
+					{
+						signedDeltaToSend = ComputeFollowerSignedDelta(follower, execution.Instrument, masterSignedDelta);
+					}
+
+					if (signedDeltaToSend == 0)
+						continue;
+
+					OrderAction action = signedDeltaToSend > 0 ? OrderAction.Buy : OrderAction.Sell;
+					SubmitOrder(follower, execution.Instrument, action, OrderType.Market,
+						Math.Abs(signedDeltaToSend), 0, 0, "Copier-" + execution.ExecutionId);
 				}
-
-				if (quantity <= 0)
-					continue;
-
-				SubmitOrder(follower, execution.Instrument, masterOrder.OrderAction, OrderType.Market,
-					quantity, 0, 0, "Copier-" + execution.ExecutionId);
+				catch (Exception ex)
+				{
+					RaiseLog(LogSeverity.Error, string.Format(
+						"{0}: copy failed on {1} - {2}. Other followers are still processed; reconciliation will catch any resulting drift.",
+						follower.DisplayName, execution.Instrument.FullName, ex.Message));
+				}
 			}
 		}
 
 		// Must be called while holding engineLock - reads/writes CopyQuantityCarry
-		// and NetPositionQuantity.
-		private int ComputeFollowerCopyQuantity(AccountState follower, int masterExecutionQuantity, bool isIncreasing)
+		// and reads NetPositionQuantity. Truncate (not Floor) is used so the
+		// carry remainder behaves correctly for negative (closing/short)
+		// deltas too, not just positive ones.
+		private int ComputeFollowerSignedDelta(AccountState follower, Instrument instrument, int masterSignedDelta)
 		{
-			decimal exact = masterExecutionQuantity * follower.QuantityMultiplier + follower.CopyQuantityCarry;
-			int wholeContracts = (int)Math.Floor(exact);
+			decimal exact = masterSignedDelta * follower.QuantityMultiplier + follower.CopyQuantityCarry;
+			int wholeContracts = (int)Math.Truncate(exact);
 			follower.CopyQuantityCarry = exact - wholeContracts;
 
-			if (wholeContracts <= 0)
+			if (wholeContracts == 0)
 				return 0;
+
+			int currentPosition = GetPosition(follower, instrument);
+			bool isIncreasing = Math.Abs(currentPosition + wholeContracts) > Math.Abs(currentPosition);
 
 			// MaxContracts is treated as a total-across-all-instruments cap on
 			// this account, matching NetPositionQuantity's rollup. If you
 			// intended a per-instrument cap instead, this needs revisiting.
+			// Only ever clips a position-increasing move - a closing/reducing
+			// trade must always be allowed through in full.
 			if (isIncreasing && follower.MaxContracts > 0 && follower.MaxContracts < int.MaxValue)
 			{
 				int allowedRoom = follower.MaxContracts - follower.NetPositionQuantity;
@@ -430,12 +472,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 						follower.DisplayName, wholeContracts, follower.MaxContracts));
 					return 0;
 				}
-				if (wholeContracts > allowedRoom)
+				if (Math.Abs(wholeContracts) > allowedRoom)
 				{
+					int clipped = wholeContracts > 0 ? allowedRoom : -allowedRoom;
 					RaiseLog(LogSeverity.Warning, string.Format(
 						"{0}: copy clipped from {1} to {2} contracts - MaxContracts limit ({3}).",
-						follower.DisplayName, wholeContracts, allowedRoom, follower.MaxContracts));
-					wholeContracts = allowedRoom;
+						follower.DisplayName, wholeContracts, clipped, follower.MaxContracts));
+					wholeContracts = clipped;
 				}
 			}
 
@@ -458,43 +501,54 @@ namespace NinjaTrader.NinjaScript.AddOns
 
 				foreach (AccountState follower in followers)
 				{
-					Dictionary<Instrument, Order> followerStops = GetFollowerStopMap(follower);
-					Order existingStop;
-					followerStops.TryGetValue(instrument, out existingStop);
-
-					if (!hasMasterStop)
+					// Isolate each follower - one bad Order/state shouldn't
+					// stop stop-sizing being checked for the rest.
+					try
 					{
-						if (existingStop != null)
+						Dictionary<Instrument, Order> followerStops = GetFollowerStopMap(follower);
+						Order existingStop;
+						followerStops.TryGetValue(instrument, out existingStop);
+
+						if (!hasMasterStop)
 						{
-							followerStops.Remove(instrument);
-							actions.Add(new Tuple<AccountState, StopAction>(follower,
-								StopAction.Cancel(existingStop, "master stop removed")));
+							if (existingStop != null)
+							{
+								followerStops.Remove(instrument);
+								actions.Add(new Tuple<AccountState, StopAction>(follower,
+									StopAction.Cancel(existingStop, "master stop removed")));
+							}
+							continue;
 						}
-						continue;
+
+						if (follower.IsLocked)
+							continue;
+
+						int desiredQuantity = Math.Abs(GetPosition(follower, instrument));
+						if (desiredQuantity <= 0)
+							continue; // follower's copied entry hasn't filled yet - retried on its next execution
+
+						bool upToDate = existingStop != null
+							&& existingStop.OrderState != OrderState.Cancelled
+							&& existingStop.OrderState != OrderState.Rejected
+							&& existingStop.OrderState != OrderState.Filled
+							&& existingStop.StopPrice == masterStop.StopPrice
+							&& existingStop.Quantity == desiredQuantity;
+
+						if (upToDate)
+							continue;
+
+						if (existingStop != null)
+							followerStops.Remove(instrument);
+
+						actions.Add(new Tuple<AccountState, StopAction>(follower,
+							StopAction.Resubmit(existingStop, masterStop, desiredQuantity)));
 					}
-
-					if (follower.IsLocked)
-						continue;
-
-					int desiredQuantity = Math.Abs(GetPosition(follower, instrument));
-					if (desiredQuantity <= 0)
-						continue; // follower's copied entry hasn't filled yet - retried on its next execution
-
-					bool upToDate = existingStop != null
-						&& existingStop.OrderState != OrderState.Cancelled
-						&& existingStop.OrderState != OrderState.Rejected
-						&& existingStop.OrderState != OrderState.Filled
-						&& existingStop.StopPrice == masterStop.StopPrice
-						&& existingStop.Quantity == desiredQuantity;
-
-					if (upToDate)
-						continue;
-
-					if (existingStop != null)
-						followerStops.Remove(instrument);
-
-					actions.Add(new Tuple<AccountState, StopAction>(follower,
-						StopAction.Resubmit(existingStop, masterStop, desiredQuantity)));
+					catch (Exception ex)
+					{
+						RaiseLog(LogSeverity.Error, string.Format(
+							"{0}: stop sync check failed on {1} - {2}. Other followers still checked.",
+							follower.DisplayName, instrument.FullName, ex.Message));
+					}
 				}
 			}
 
@@ -729,6 +783,15 @@ namespace NinjaTrader.NinjaScript.AddOns
 			EventHandler<CopierLogEventArgs> handler = LogMessage;
 			if (handler != null)
 				handler(this, new CopierLogEventArgs(message, severity));
+		}
+
+		// Lets other parts of the AddOn (CopierManager's per-account
+		// RiskManager.Evaluate/RolloverToNewTradingDay calls) surface
+		// failures into the same log feed the dashboard already displays,
+		// since RiskManager has no logging channel of its own.
+		public void Log(LogSeverity severity, string message)
+		{
+			RaiseLog(severity, message);
 		}
 	}
 }

@@ -119,25 +119,62 @@ namespace NinjaTrader.Gui.NinjaScript
 			if (today != lastRolloverDate)
 			{
 				lastRolloverDate = today;
-				RiskManager.RolloverToNewTradingDay(Master, RiskManager.GetLiveEquity(Master));
+				SafeRolloverAccount(Master);
 				foreach (AccountState follower in Followers)
-					RiskManager.RolloverToNewTradingDay(follower, RiskManager.GetLiveEquity(follower));
+					SafeRolloverAccount(follower);
 			}
 
-			RiskManager.Evaluate(Master);
+			SafeEvaluateAccount(Master);
 			foreach (AccountState follower in Followers)
-				RiskManager.Evaluate(follower);
+				SafeEvaluateAccount(follower);
 
 			reconciliationTickCounter++;
 			if (reconciliationTickCounter >= ReconciliationEveryNTicks)
 			{
 				reconciliationTickCounter = 0;
-				Engine.RunReconciliation();
+				// RunReconciliation already isolates per-follower failures
+				// internally and logs them - this only guards the call itself.
+				try
+				{
+					Engine.RunReconciliation();
+				}
+				catch (Exception ex)
+				{
+					Engine.Log(LogSeverity.Error, "Reconciliation cycle failed - " + ex.Message);
+				}
 			}
 
 			EventHandler handler = Tick;
 			if (handler != null)
 				handler(null, EventArgs.Empty);
+		}
+
+		// One account's failure here must never stop the rest from being
+		// evaluated/rolled over - this is the same bug class reported and
+		// fixed in CopierEngine's per-follower loops, applied here too since
+		// this loop has the identical shape.
+		private static void SafeEvaluateAccount(AccountState state)
+		{
+			try
+			{
+				RiskManager.Evaluate(state);
+			}
+			catch (Exception ex)
+			{
+				Engine.Log(LogSeverity.Error, string.Format("{0}: risk evaluation failed - {1}. Will retry next tick.", state.DisplayName, ex.Message));
+			}
+		}
+
+		private static void SafeRolloverAccount(AccountState state)
+		{
+			try
+			{
+				RiskManager.RolloverToNewTradingDay(state, RiskManager.GetLiveEquity(state));
+			}
+			catch (Exception ex)
+			{
+				Engine.Log(LogSeverity.Error, string.Format("{0}: end-of-day rollover failed - {1}.", state.DisplayName, ex.Message));
+			}
 		}
 	}
 
