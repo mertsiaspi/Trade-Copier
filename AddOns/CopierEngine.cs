@@ -264,6 +264,13 @@ namespace NinjaTrader.NinjaScript.AddOns
 			// is always populated.
 			CopyExecutionToFollowers(execution);
 			SyncFollowerStops(execution.Instrument);
+
+			// Master going flat (via the "Close" button, a limit fill, a
+			// stop, anything) is the single highest-stakes moment to confirm
+			// every follower actually got out too - don't wait for the next
+			// scheduled reconciliation tick, check right now.
+			if (GetPosition(master, execution.Instrument) == 0)
+				RunReconciliation();
 		}
 
 		private void OnMasterOrderUpdate(object sender, OrderEventArgs e)
