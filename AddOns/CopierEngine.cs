@@ -172,11 +172,15 @@ namespace NinjaTrader.NinjaScript.AddOns
 				// for one follower used to abort the whole foreach, silently
 				// leaving every subsequent follower unreconciled - possibly
 				// forever, if the same exception recurred every cycle. Each
-				// follower is now fully isolated.
+				// follower is now fully isolated. The decide-and-act sequence
+				// also runs under one lock acquisition now (matching
+				// SyncFollowerStops/SyncFollowerPositions), since deciding
+				// under the lock and acting after it let an overlapping call
+				// - the periodic timer tick and the immediate on-flat check
+				// firing close together, for example - double-send the same
+				// correction.
 				try
 				{
-					List<Tuple<Instrument, int>> corrections = new List<Tuple<Instrument, int>>();
-
 					lock (engineLock)
 					{
 						HashSet<Instrument> instruments = new HashSet<Instrument>(GetPositionMap(master).Keys);
@@ -197,20 +201,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 								"{0}: reconciliation mismatch on {1} - master implies {2}, follower has {3} (delta {4}).",
 								follower.DisplayName, instrument.FullName, targetQty, followerQty, delta));
 
-							if (AutoCorrectReconciliation)
-								corrections.Add(new Tuple<Instrument, int>(instrument, delta));
-						}
-					}
+							if (!AutoCorrectReconciliation)
+								continue;
 
-					foreach (Tuple<Instrument, int> correction in corrections)
-					{
-						// NOTE: uses the plain Buy/Sell pair, not SellShort/BuyToCover -
-						// verify this is the right action pair for how your follower
-						// accounts are configured (futures accounts are usually fine
-						// with Buy/Sell for both opening and closing).
-						OrderAction action = correction.Item2 > 0 ? OrderAction.Buy : OrderAction.Sell;
-						SubmitOrder(follower, correction.Item1, action, OrderType.Market, Math.Abs(correction.Item2), 0, 0,
-							"Reconcile-" + follower.DisplayName);
+							// NOTE: uses the plain Buy/Sell pair, not SellShort/BuyToCover -
+							// verify this is the right action pair for how your follower
+							// accounts are configured (futures accounts are usually fine
+							// with Buy/Sell for both opening and closing).
+							OrderAction action = delta > 0 ? OrderAction.Buy : OrderAction.Sell;
+							SubmitOrder(follower, instrument, action, OrderType.Market, Math.Abs(delta), 0, 0,
+								"Reconcile-" + follower.DisplayName);
+						}
 					}
 				}
 				catch (Exception ex)
@@ -411,25 +412,31 @@ namespace NinjaTrader.NinjaScript.AddOns
 		// fills the follower's own mirrored stop may or may not have already
 		// handled. This is also exactly what makes it self-healing for a
 		// follower that was out of sync for any reason going in.
+		// Held for the whole decide-and-act sequence per follower, same
+		// reasoning as SyncFollowerStops: this can be triggered from more
+		// than one event for what amounts to the same logical moment (a
+		// master execution and a shortly-following follower execution both
+		// calling this for the same instrument), and deciding under the lock
+		// but acting after it let those overlap into duplicate orders.
 		private void SyncFollowerPositions(Instrument instrument)
 		{
-			foreach (AccountState follower in followers)
+			lock (engineLock)
 			{
-				if (follower.IsLocked)
-					continue;
-
-				// One follower's failure must never stop the rest from being
-				// processed - an uncaught exception here used to silently
-				// abort the loop partway through the follower list.
-				try
+				foreach (AccountState follower in followers)
 				{
-					int delta;
-					lock (engineLock)
+					if (follower.IsLocked)
+						continue;
+
+					// One follower's failure must never stop the rest from
+					// being processed - an uncaught exception here used to
+					// silently abort the loop partway through the follower
+					// list.
+					try
 					{
 						int masterQty = GetPosition(master, instrument);
 						int followerQty = GetPosition(follower, instrument);
 						int targetQty = (int)Math.Round(masterQty * follower.QuantityMultiplier, MidpointRounding.AwayFromZero);
-						delta = targetQty - followerQty;
+						int delta = targetQty - followerQty;
 
 						// MaxContracts is treated as a total-across-all-instruments
 						// cap on this account, matching NetPositionQuantity's
@@ -456,20 +463,20 @@ namespace NinjaTrader.NinjaScript.AddOns
 								delta = clipped;
 							}
 						}
+
+						if (delta == 0)
+							continue;
+
+						OrderAction action = delta > 0 ? OrderAction.Buy : OrderAction.Sell;
+						SubmitOrder(follower, instrument, action, OrderType.Market, Math.Abs(delta), 0, 0,
+							"Copier-" + follower.DisplayName + "-" + instrument.FullName);
 					}
-
-					if (delta == 0)
-						continue;
-
-					OrderAction action = delta > 0 ? OrderAction.Buy : OrderAction.Sell;
-					SubmitOrder(follower, instrument, action, OrderType.Market, Math.Abs(delta), 0, 0,
-						"Copier-" + follower.DisplayName + "-" + instrument.FullName);
-				}
-				catch (Exception ex)
-				{
-					RaiseLog(LogSeverity.Error, string.Format(
-						"{0}: position sync failed on {1} - {2}. Other followers are still processed.",
-						follower.DisplayName, instrument.FullName, ex.Message));
+					catch (Exception ex)
+					{
+						RaiseLog(LogSeverity.Error, string.Format(
+							"{0}: position sync failed on {1} - {2}. Other followers are still processed.",
+							follower.DisplayName, instrument.FullName, ex.Message));
+					}
 				}
 			}
 		}
@@ -479,13 +486,24 @@ namespace NinjaTrader.NinjaScript.AddOns
 		// Called both when master's stop changes AND when a follower's own
 		// position changes, so a follower whose entry fills late still gets a
 		// correctly-sized stop once its position catches up.
+		//
+		// The whole decide-and-act sequence runs under one lock acquisition,
+		// deliberately including the Cancel/Submit calls. This used to decide
+		// under the lock and act afterward, which let two near-simultaneous
+		// triggers for the same logical stop placement - NT8 firing
+		// OrderState.Accepted then Working as separate OnMasterOrderUpdate
+		// events for the same new order, for example - both decide "no
+		// mirrored stop exists yet" before either had recorded its own
+		// submission. Each independently submitted one, multiplying the
+		// mirrored stop's effective quantity by however many redundant
+		// triggers overlapped. Order submission is fire-and-forget (it
+		// doesn't block on a fill), so holding the lock this long is not a
+		// real contention concern - it is the fix.
 		private void SyncFollowerStops(Instrument instrument)
 		{
-			Order masterStop;
-			List<Tuple<AccountState, StopAction>> actions = new List<Tuple<AccountState, StopAction>>();
-
 			lock (engineLock)
 			{
+				Order masterStop;
 				bool hasMasterStop = masterStopByInstrument.TryGetValue(instrument, out masterStop);
 
 				foreach (AccountState follower in followers)
@@ -503,8 +521,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 							if (existingStop != null)
 							{
 								followerStops.Remove(instrument);
-								actions.Add(new Tuple<AccountState, StopAction>(follower,
-									StopAction.Cancel(existingStop, "master stop removed")));
+								CancelOrder(follower, existingStop, "master stop removed");
 							}
 							continue;
 						}
@@ -526,88 +543,37 @@ namespace NinjaTrader.NinjaScript.AddOns
 						if (upToDate)
 							continue;
 
-						if (existingStop != null)
-							followerStops.Remove(instrument);
+						// Remove from tracking BEFORE submitting, not after -
+						// so if this same method somehow re-entered for this
+						// follower before the submit below returns, it would
+						// see no tracked stop and correctly fall through to
+						// this same branch rather than a stale "up to date"
+						// read, instead of silently doing nothing.
+						followerStops.Remove(instrument);
 
-						actions.Add(new Tuple<AccountState, StopAction>(follower,
-							StopAction.Resubmit(existingStop, masterStop, desiredQuantity)));
+						if (existingStop != null)
+						{
+							// Follower is briefly unprotected between this
+							// cancel and the resubmit below - a cancel+replace
+							// is simpler and safer to get right than
+							// Account.Change(), but flag the gap.
+							CancelOrder(follower, existingStop, "resyncing to master stop change");
+						}
+
+						Order newStop = SubmitOrder(follower, instrument, masterStop.OrderAction, masterStop.OrderType,
+							desiredQuantity, masterStop.LimitPrice, masterStop.StopPrice,
+							"Copier-Stop-" + follower.DisplayName);
+
+						if (newStop != null)
+							followerStops[instrument] = newStop;
 					}
 					catch (Exception ex)
 					{
 						RaiseLog(LogSeverity.Error, string.Format(
-							"{0}: stop sync check failed on {1} - {2}. Other followers still checked.",
+							"{0}: stop sync failed on {1} - {2}. Other followers still processed.",
 							follower.DisplayName, instrument.FullName, ex.Message));
 					}
 				}
-			}
-
-			foreach (Tuple<AccountState, StopAction> entry in actions)
-			{
-				AccountState follower = entry.Item1;
-				StopAction action = entry.Item2;
-
-				// CancelOrder/SubmitOrder already catch internally, but wrap
-				// the whole per-follower entry too - consistent with every
-				// other per-follower loop in this file, so nothing here can
-				// ever skip a later follower in the same batch.
-				try
-				{
-					if (action.OrderToCancel != null)
-						CancelOrder(follower, action.OrderToCancel, action.CancelReason);
-
-					if (action.MasterStopToMirror != null)
-					{
-						// Follower is briefly unprotected between the cancel
-						// above and this resubmit - a cancel+replace is
-						// simpler and safer to get right than
-						// Account.Change(), but flag the gap.
-						Order newStop = SubmitOrder(follower, instrument, action.MasterStopToMirror.OrderAction,
-							action.MasterStopToMirror.OrderType, action.DesiredQuantity,
-							action.MasterStopToMirror.LimitPrice, action.MasterStopToMirror.StopPrice,
-							"Copier-Stop-" + follower.DisplayName);
-
-						if (newStop != null)
-						{
-							lock (engineLock)
-							{
-								GetFollowerStopMap(follower)[instrument] = newStop;
-							}
-						}
-					}
-				}
-				catch (Exception ex)
-				{
-					RaiseLog(LogSeverity.Error, string.Format(
-						"{0}: stop sync action failed on {1} - {2}. Other followers still processed.",
-						follower.DisplayName, instrument.FullName, ex.Message));
-				}
-			}
-		}
-
-		// Tiny local record for the two things SyncFollowerStops can decide to
-		// do per follower - kept as a struct instead of two parallel lists so
-		// the cancel-then-resubmit ordering per follower can't drift apart.
-		private struct StopAction
-		{
-			public Order OrderToCancel;
-			public string CancelReason;
-			public Order MasterStopToMirror;
-			public int DesiredQuantity;
-
-			public static StopAction Cancel(Order order, string reason)
-			{
-				return new StopAction { OrderToCancel = order, CancelReason = reason };
-			}
-
-			public static StopAction Resubmit(Order existingOrNull, Order masterStop, int desiredQuantity)
-			{
-				return new StopAction
-				{
-					OrderToCancel = existingOrNull,
-					CancelReason = "resyncing to master stop change",
-					MasterStopToMirror = masterStop,
-					DesiredQuantity = desiredQuantity
-				};
 			}
 		}
 
