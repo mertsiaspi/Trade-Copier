@@ -194,6 +194,29 @@ namespace NinjaTrader.Gui.NinjaScript
 				Description = "NT8 Trade Copier + Risk Manager dashboard";
 				Name = "Trade Copier";
 			}
+			else if (State == State.Terminated)
+			{
+				// Recompiling (F5 in the NinjaScript Editor) can leave the OLD
+				// AddOn instance running with its old event subscriptions
+				// instead of being replaced cleanly - this is documented NT8
+				// behavior ("occasionally you end up with two instances still
+				// running" per the NinjaTrader support forum). Without this
+				// cleanup, a recompile mid-session leaves the previous
+				// CopierManager still subscribed to master's execution/order
+				// events, running ALONGSIDE a freshly-armed one from the new
+				// instance - every real trade then gets copied once per
+				// still-alive instance, multiplying the quantity sent to
+				// every follower. Dispatched onto the UI thread since
+				// CopierManager's timer belongs to it.
+				if (CopierManager.IsRunning)
+				{
+					NinjaTrader.Core.Globals.RandomDispatcher.InvokeAsync(new Action(() =>
+					{
+						if (CopierManager.IsRunning)
+							CopierManager.Stop();
+					}));
+				}
+			}
 		}
 
 		protected override void OnWindowCreated(Window window)
