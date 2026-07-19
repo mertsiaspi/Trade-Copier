@@ -237,11 +237,20 @@ namespace NinjaTrader.NinjaScript.AddOns
 
 				UpdatePositionFromExecution(master, execution);
 
-				Order masterOrder = execution.Order;
+				// Checked via the TRACKED STOP'S OWN state, not by matching
+				// execution.Order against it by reference. This used to
+				// require execution.Order to be the exact same object, which
+				// silently failed whenever it was null - and that turns out
+				// to happen for stop fills too, not just limit/ATM-style
+				// exits. OrderUpdate(Filled) always fires before
+				// ExecutionUpdate for the same fill (mutating the same Order
+				// object in place), so by the time we get here the tracked
+				// stop's own OrderState already reflects Filled if it was
+				// this fill that completed it - regardless of whether this
+				// particular Execution carries an Order reference at all.
 				Order trackedStop;
-				isReCopyOfMirroredStop = masterOrder != null
-					&& masterStopByInstrument.TryGetValue(execution.Instrument, out trackedStop)
-					&& ReferenceEquals(trackedStop, masterOrder);
+				isReCopyOfMirroredStop = masterStopByInstrument.TryGetValue(execution.Instrument, out trackedStop)
+					&& trackedStop.OrderState == OrderState.Filled;
 
 				if (isReCopyOfMirroredStop)
 					masterStopByInstrument.Remove(execution.Instrument);
@@ -252,23 +261,25 @@ namespace NinjaTrader.NinjaScript.AddOns
 				RaiseLog(LogSeverity.Info, string.Format(
 					"{0}: master stop filled on {1} ({2} x{3}) - follower stops fill on their own, not re-copying.",
 					master.DisplayName, execution.Instrument.FullName, execution.MarketPosition, execution.Quantity));
-				return;
 			}
-
-			// Deliberately NOT gated on execution.Order being non-null anymore
-			// (it was originally, and that was the real bug: some fills -
-			// e.g. profit-target/ATM-style exits - report a null Order, which
-			// meant this whole copy was skipped and silently left to a
-			// reconciliation cycle up to ReconciliationEveryNTicks away to
-			// catch. The direction only needs execution.MarketPosition, which
-			// is always populated.
-			CopyExecutionToFollowers(execution);
-			SyncFollowerStops(execution.Instrument);
+			else
+			{
+				// Deliberately NOT gated on execution.Order being non-null
+				// (that was the original bug: some fills - e.g. profit-
+				// target/ATM-style exits - report a null Order, which meant
+				// this whole copy was skipped and silently left to whatever
+				// reconciliation cycle came next). Direction only needs
+				// execution.MarketPosition, which is always populated.
+				CopyExecutionToFollowers(execution);
+				SyncFollowerStops(execution.Instrument);
+			}
 
 			// Master going flat (via the "Close" button, a limit fill, a
 			// stop, anything) is the single highest-stakes moment to confirm
-			// every follower actually got out too - don't wait for the next
-			// scheduled reconciliation tick, check right now.
+			// every follower actually got out too - including the stop-refill
+			// branch above, since a follower whose own mirrored stop was
+			// never successfully submitted has nothing to close it otherwise.
+			// Don't wait for the next scheduled reconciliation tick, check now.
 			if (GetPosition(master, execution.Instrument) == 0)
 				RunReconciliation();
 		}
@@ -564,26 +575,40 @@ namespace NinjaTrader.NinjaScript.AddOns
 				AccountState follower = entry.Item1;
 				StopAction action = entry.Item2;
 
-				if (action.OrderToCancel != null)
-					CancelOrder(follower, action.OrderToCancel, action.CancelReason);
-
-				if (action.MasterStopToMirror != null)
+				// CancelOrder/SubmitOrder already catch internally, but wrap
+				// the whole per-follower entry too - consistent with every
+				// other per-follower loop in this file, so nothing here can
+				// ever skip a later follower in the same batch.
+				try
 				{
-					// Follower is briefly unprotected between the cancel above
-					// and this resubmit - a cancel+replace is simpler and safer
-					// to get right than Account.Change(), but flag the gap.
-					Order newStop = SubmitOrder(follower, instrument, action.MasterStopToMirror.OrderAction,
-						action.MasterStopToMirror.OrderType, action.DesiredQuantity,
-						action.MasterStopToMirror.LimitPrice, action.MasterStopToMirror.StopPrice,
-						"Copier-Stop-" + follower.DisplayName);
+					if (action.OrderToCancel != null)
+						CancelOrder(follower, action.OrderToCancel, action.CancelReason);
 
-					if (newStop != null)
+					if (action.MasterStopToMirror != null)
 					{
-						lock (engineLock)
+						// Follower is briefly unprotected between the cancel
+						// above and this resubmit - a cancel+replace is
+						// simpler and safer to get right than
+						// Account.Change(), but flag the gap.
+						Order newStop = SubmitOrder(follower, instrument, action.MasterStopToMirror.OrderAction,
+							action.MasterStopToMirror.OrderType, action.DesiredQuantity,
+							action.MasterStopToMirror.LimitPrice, action.MasterStopToMirror.StopPrice,
+							"Copier-Stop-" + follower.DisplayName);
+
+						if (newStop != null)
 						{
-							GetFollowerStopMap(follower)[instrument] = newStop;
+							lock (engineLock)
+							{
+								GetFollowerStopMap(follower)[instrument] = newStop;
+							}
 						}
 					}
+				}
+				catch (Exception ex)
+				{
+					RaiseLog(LogSeverity.Error, string.Format(
+						"{0}: stop sync action failed on {1} - {2}. Other followers still processed.",
+						follower.DisplayName, instrument.FullName, ex.Message));
 				}
 			}
 		}
