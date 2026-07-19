@@ -228,6 +228,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (execution == null)
 				return;
 
+			Order masterOrder;
 			bool isReCopyOfMirroredStop;
 
 			lock (engineLock)
@@ -235,22 +236,17 @@ namespace NinjaTrader.NinjaScript.AddOns
 				if (!TryMarkExecutionProcessed(execution.ExecutionId))
 					return;
 
+				// Position bookkeeping always uses Order.OrderAction when
+				// available (unambiguous), and only falls back to a direct
+				// ground-truth resync from the account when Order is null -
+				// never a guess. See UpdatePositionFromExecution.
 				UpdatePositionFromExecution(master, execution);
 
-				// Checked via the TRACKED STOP'S OWN state, not by matching
-				// execution.Order against it by reference. This used to
-				// require execution.Order to be the exact same object, which
-				// silently failed whenever it was null - and that turns out
-				// to happen for stop fills too, not just limit/ATM-style
-				// exits. OrderUpdate(Filled) always fires before
-				// ExecutionUpdate for the same fill (mutating the same Order
-				// object in place), so by the time we get here the tracked
-				// stop's own OrderState already reflects Filled if it was
-				// this fill that completed it - regardless of whether this
-				// particular Execution carries an Order reference at all.
+				masterOrder = execution.Order;
 				Order trackedStop;
-				isReCopyOfMirroredStop = masterStopByInstrument.TryGetValue(execution.Instrument, out trackedStop)
-					&& trackedStop.OrderState == OrderState.Filled;
+				isReCopyOfMirroredStop = masterOrder != null
+					&& masterStopByInstrument.TryGetValue(execution.Instrument, out trackedStop)
+					&& ReferenceEquals(trackedStop, masterOrder);
 
 				if (isReCopyOfMirroredStop)
 					masterStopByInstrument.Remove(execution.Instrument);
@@ -260,26 +256,36 @@ namespace NinjaTrader.NinjaScript.AddOns
 			{
 				RaiseLog(LogSeverity.Info, string.Format(
 					"{0}: master stop filled on {1} ({2} x{3}) - follower stops fill on their own, not re-copying.",
-					master.DisplayName, execution.Instrument.FullName, execution.MarketPosition, execution.Quantity));
+					master.DisplayName, execution.Instrument.FullName, masterOrder.OrderAction, execution.Quantity));
+			}
+			else if (masterOrder == null)
+			{
+				// Do NOT guess a direction here. A previous attempt to derive
+				// one from execution.MarketPosition sent a follower a wrong-
+				// direction order that opened an unintended position -
+				// exactly the "if unsure, don't send an order" case CLAUDE.md
+				// calls out. Position bookkeeping above was already resynced
+				// from the account directly; the reconciliation check below
+				// computes any correction from the actual position gap
+				// (safe - it can only move a follower toward the target, it
+				// can never guess a wrong direction) rather than from a
+				// per-execution inference.
+				RaiseLog(LogSeverity.Warning, string.Format(
+					"{0}: execution {1} has no Order reference - cannot determine the exact action, skipping direct copy. " +
+					"An immediate reconciliation check follows.",
+					master.DisplayName, execution.ExecutionId));
 			}
 			else
 			{
-				// Deliberately NOT gated on execution.Order being non-null
-				// (that was the original bug: some fills - e.g. profit-
-				// target/ATM-style exits - report a null Order, which meant
-				// this whole copy was skipped and silently left to whatever
-				// reconciliation cycle came next). Direction only needs
-				// execution.MarketPosition, which is always populated.
-				CopyExecutionToFollowers(execution);
+				CopyExecutionToFollowers(execution, masterOrder);
 				SyncFollowerStops(execution.Instrument);
 			}
 
 			// Master going flat (via the "Close" button, a limit fill, a
 			// stop, anything) is the single highest-stakes moment to confirm
-			// every follower actually got out too - including the stop-refill
-			// branch above, since a follower whose own mirrored stop was
-			// never successfully submitted has nothing to close it otherwise.
-			// Don't wait for the next scheduled reconciliation tick, check now.
+			// every follower actually got out too, and it's also the safety
+			// net for the "no Order reference" case above. Runs regardless
+			// of which branch was taken.
 			if (GetPosition(master, execution.Instrument) == 0)
 				RunReconciliation();
 		}
@@ -406,28 +412,26 @@ namespace NinjaTrader.NinjaScript.AddOns
 			}
 		}
 
-		// Uses execution.MarketPosition (always populated) to get a signed
-		// position delta rather than replaying masterOrder.OrderAction - this
-		// works even when execution.Order is null (documented to happen for
-		// some fills, e.g. ATM/profit-target style exits), which used to mean
-		// the whole copy was skipped and left entirely to the next
-		// reconciliation cycle.
-		private void CopyExecutionToFollowers(Execution execution)
+		// masterOrder.OrderAction is the only source of truth used for
+		// direction here - it is unambiguous. An earlier attempt to derive
+		// direction from execution.MarketPosition instead (to work around
+		// execution.Order sometimes being null) sent a wrong-direction order
+		// to a follower in production; the null-Order case is now handled
+		// by the caller skipping this method entirely and relying on
+		// reconciliation instead of guessing.
+		private void CopyExecutionToFollowers(Execution execution, Order masterOrder)
 		{
-			int masterSignedDelta = execution.MarketPosition == MarketPosition.Long ? execution.Quantity
-				: execution.MarketPosition == MarketPosition.Short ? -execution.Quantity
-				: 0;
-
-			if (masterSignedDelta == 0)
-				return;
+			int masterSignedDelta = (masterOrder.OrderAction == OrderAction.Buy || masterOrder.OrderAction == OrderAction.BuyToCover)
+				? execution.Quantity
+				: -execution.Quantity;
 
 			foreach (AccountState follower in followers)
 			{
 				if (follower.IsLocked)
 				{
 					RaiseLog(LogSeverity.Warning, string.Format(
-						"{0}: skipped copy on {1} (master delta {2}{3}) - account is locked.",
-						follower.DisplayName, execution.Instrument.FullName, masterSignedDelta > 0 ? "+" : "", masterSignedDelta));
+						"{0}: skipped copy of {1} x{2} on {3} - account is locked.",
+						follower.DisplayName, masterOrder.OrderAction, execution.Quantity, execution.Instrument.FullName));
 					continue;
 				}
 
@@ -640,13 +644,55 @@ namespace NinjaTrader.NinjaScript.AddOns
 			}
 		}
 
+		// Must be called while holding engineLock. Uses Order.OrderAction when
+		// available (unambiguous); when Order is null, resyncs this
+		// instrument's position directly from the account's actual current
+		// position instead of guessing a sign from execution.MarketPosition -
+		// that guess turned out to be wrong and sent a follower an unintended
+		// position in production. See git history for the incident.
 		private void UpdatePositionFromExecution(AccountState state, Execution execution)
 		{
-			int signedDelta = execution.MarketPosition == MarketPosition.Long ? execution.Quantity
-				: execution.MarketPosition == MarketPosition.Short ? -execution.Quantity
-				: 0;
+			if (execution.Order != null)
+			{
+				int signedDelta = (execution.Order.OrderAction == OrderAction.Buy || execution.Order.OrderAction == OrderAction.BuyToCover)
+					? execution.Quantity
+					: -execution.Quantity;
+				AdjustPosition(state, execution.Instrument, signedDelta);
+			}
+			else
+			{
+				ResyncPositionFromAccount(state, execution.Instrument);
+			}
+		}
 
-			AdjustPosition(state, execution.Instrument, signedDelta);
+		// Must be called while holding engineLock. Ground truth from
+		// Account.Positions (Position.MarketPosition, not the less certain
+		// Execution.MarketPosition) rather than an incremental guess.
+		private void ResyncPositionFromAccount(AccountState state, Instrument instrument)
+		{
+			int actualSignedQty = 0;
+			foreach (Position position in state.NinjaAccount.Positions)
+			{
+				if (ReferenceEquals(position.Instrument, instrument))
+				{
+					actualSignedQty = position.MarketPosition == MarketPosition.Long ? position.Quantity
+						: position.MarketPosition == MarketPosition.Short ? -position.Quantity
+						: 0;
+					break;
+				}
+			}
+
+			Dictionary<Instrument, int> map = GetPositionMap(state);
+			map[instrument] = actualSignedQty;
+
+			int totalAbs = 0;
+			foreach (int qty in map.Values)
+				totalAbs += Math.Abs(qty);
+
+			state.NetPositionQuantity = totalAbs;
+			state.PositionDirection = actualSignedQty > 0 ? MarketPosition.Long
+				: actualSignedQty < 0 ? MarketPosition.Short
+				: MarketPosition.Flat;
 		}
 
 		// Must be called while holding engineLock.

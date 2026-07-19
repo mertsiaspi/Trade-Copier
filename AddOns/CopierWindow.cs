@@ -394,9 +394,11 @@ namespace NinjaTrader.Gui.NinjaScript
 
 		private ComboBox masterCombo;
 		private Button armButton;
+		private CheckBox autoCorrectCheckBox;
 		private TextBlock masterSummaryText;
 		private Border masterStatusIndicator;
 		private CopierEngine subscribedEngine;
+		private bool suppressAutoCorrectEvent;
 
 		public CopierWindow()
 		{
@@ -568,8 +570,17 @@ namespace NinjaTrader.Gui.NinjaScript
 
 			masterRow.State.Role = AccountRole.Master;
 			CopierManager.Start(masterRow.State, newFollowers);
+			CopierManager.Engine.AutoCorrectReconciliation = autoCorrectCheckBox.IsChecked == true;
 
 			RefreshAllRows();
+		}
+
+		private void OnAutoCorrectChanged(object sender, RoutedEventArgs e)
+		{
+			if (suppressAutoCorrectEvent || !CopierManager.IsRunning)
+				return;
+
+			CopierManager.Engine.AutoCorrectReconciliation = autoCorrectCheckBox.IsChecked == true;
 		}
 
 		// Only reseeds the trailing high-water-mark/EOD baseline if the
@@ -697,6 +708,22 @@ namespace NinjaTrader.Gui.NinjaScript
 			Button refreshButton = new Button { Content = "Refresh Accounts", Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(0, 0, 12, 0) };
 			refreshButton.Click += (s, e) => { RebuildAccountRows(); RefreshAllRows(); };
 			row.Children.Add(refreshButton);
+
+			// Off by default (warn-only). When a master execution's Order
+			// reference is null, the engine skips a direct copy rather than
+			// guessing a direction, and relies entirely on reconciliation to
+			// actually fix the resulting gap - so if this stays off, that
+			// case only ever gets logged, never corrected.
+			autoCorrectCheckBox = new CheckBox
+			{
+				Content = "Auto-correct reconciliation",
+				Foreground = ThemeForeground,
+				VerticalAlignment = VerticalAlignment.Center,
+				Margin = new Thickness(0, 0, 12, 0)
+			};
+			autoCorrectCheckBox.Checked += OnAutoCorrectChanged;
+			autoCorrectCheckBox.Unchecked += OnAutoCorrectChanged;
+			row.Children.Add(autoCorrectCheckBox);
 
 			armButton = new Button { Content = "Arm", Width = 90, Padding = new Thickness(6, 2, 6, 2), Margin = new Thickness(0, 0, 12, 0) };
 			armButton.Click += OnArmClick;
@@ -873,6 +900,13 @@ namespace NinjaTrader.Gui.NinjaScript
 				masterStatusIndicator.Background = Brushes.Gray;
 				return;
 			}
+
+			// Reflect the engine's actual setting without re-triggering
+			// OnAutoCorrectChanged (which would just write the same value
+			// straight back).
+			suppressAutoCorrectEvent = true;
+			autoCorrectCheckBox.IsChecked = CopierManager.Engine.AutoCorrectReconciliation;
+			suppressAutoCorrectEvent = false;
 
 			AccountState masterState = CopierManager.Master;
 			decimal equity = CopierManager.RiskManager.GetLiveEquity(masterState);
