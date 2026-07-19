@@ -82,12 +82,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 		// precise multi-instrument view, read CopierEngine's per-instrument map.
 		public MarketPosition PositionDirection { get; set; } = MarketPosition.Flat;
 
-		// Fractional contracts "owed" to this follower from previous rounding
-		// when QuantityMultiplier isn't a whole number, so partial fills (and
-		// multiple small fills) sum to the correct total instead of losing
-		// remainders through repeated floor-rounding. Maintained by CopierEngine.
-		public decimal CopyQuantityCarry { get; set; }
-
 		public bool IsLocked { get; private set; }
 		public string LockReason { get; private set; }
 

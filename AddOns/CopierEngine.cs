@@ -228,9 +228,6 @@ namespace NinjaTrader.NinjaScript.AddOns
 			if (execution == null)
 				return;
 
-			Order masterOrder;
-			bool isReCopyOfMirroredStop;
-
 			lock (engineLock)
 			{
 				if (!TryMarkExecutionProcessed(execution.ExecutionId))
@@ -242,50 +239,43 @@ namespace NinjaTrader.NinjaScript.AddOns
 				// never a guess. See UpdatePositionFromExecution.
 				UpdatePositionFromExecution(master, execution);
 
-				masterOrder = execution.Order;
+				// If this execution completed the stop tracked for this
+				// instrument, stop tracking it - SyncFollowerStops needs to
+				// know master no longer has an active stop so it won't try
+				// to keep mirroring a filled one. SyncFollowerPositions below
+				// does not need this distinction at all: it is driven by
+				// actual position numbers, not by what kind of order caused
+				// them to change.
+				Order masterOrder = execution.Order;
 				Order trackedStop;
-				isReCopyOfMirroredStop = masterOrder != null
+				if (masterOrder != null
 					&& masterStopByInstrument.TryGetValue(execution.Instrument, out trackedStop)
-					&& ReferenceEquals(trackedStop, masterOrder);
-
-				if (isReCopyOfMirroredStop)
+					&& ReferenceEquals(trackedStop, masterOrder))
+				{
 					masterStopByInstrument.Remove(execution.Instrument);
+				}
 			}
 
-			if (isReCopyOfMirroredStop)
-			{
-				RaiseLog(LogSeverity.Info, string.Format(
-					"{0}: master stop filled on {1} ({2} x{3}) - follower stops fill on their own, not re-copying.",
-					master.DisplayName, execution.Instrument.FullName, masterOrder.OrderAction, execution.Quantity));
-			}
-			else if (masterOrder == null)
-			{
-				// Do NOT guess a direction here. A previous attempt to derive
-				// one from execution.MarketPosition sent a follower a wrong-
-				// direction order that opened an unintended position -
-				// exactly the "if unsure, don't send an order" case CLAUDE.md
-				// calls out. Position bookkeeping above was already resynced
-				// from the account directly; the reconciliation check below
-				// computes any correction from the actual position gap
-				// (safe - it can only move a follower toward the target, it
-				// can never guess a wrong direction) rather than from a
-				// per-execution inference.
-				RaiseLog(LogSeverity.Warning, string.Format(
-					"{0}: execution {1} has no Order reference - cannot determine the exact action, skipping direct copy. " +
-					"An immediate reconciliation check follows.",
-					master.DisplayName, execution.ExecutionId));
-			}
-			else
-			{
-				CopyExecutionToFollowers(execution, masterOrder);
-				SyncFollowerStops(execution.Instrument);
-			}
+			// Always syncs every follower toward master's ACTUAL current
+			// position x multiplier, rather than replaying this one
+			// execution's own delta. That distinction is exactly what fixed
+			// two real bugs: (1) closing master's position while a follower
+			// was already out of sync (e.g. its own mirrored stop never
+			// fired) used to send that follower a naked order that OPENED a
+			// new position instead of closing nothing; a target-based sync
+			// computes 0 in that case. (2) A follower whose own mirrored
+			// stop failed to fire for any reason is now caught immediately
+			// here instead of only by a possibly-disabled auto-correct
+			// reconciliation cycle. This is idempotent - a no-op for a
+			// follower already at its target - so it is safe to call after
+			// every execution unconditionally, stop fills included.
+			SyncFollowerPositions(execution.Instrument);
+			SyncFollowerStops(execution.Instrument);
 
 			// Master going flat (via the "Close" button, a limit fill, a
-			// stop, anything) is the single highest-stakes moment to confirm
-			// every follower actually got out too, and it's also the safety
-			// net for the "no Order reference" case above. Runs regardless
-			// of which branch was taken.
+			// stop, anything) is the highest-stakes moment to also sweep any
+			// OTHER instrument a follower might be holding that master isn't
+			// (SyncFollowerPositions above only checked this one instrument).
 			if (GetPosition(master, execution.Instrument) == 0)
 				RunReconciliation();
 		}
@@ -412,99 +402,76 @@ namespace NinjaTrader.NinjaScript.AddOns
 			}
 		}
 
-		// masterOrder.OrderAction is the only source of truth used for
-		// direction here - it is unambiguous. An earlier attempt to derive
-		// direction from execution.MarketPosition instead (to work around
-		// execution.Order sometimes being null) sent a wrong-direction order
-		// to a follower in production; the null-Order case is now handled
-		// by the caller skipping this method entirely and relying on
-		// reconciliation instead of guessing.
-		private void CopyExecutionToFollowers(Execution execution, Order masterOrder)
+		// Target-based sync for one instrument: computes what each follower's
+		// position SHOULD be (master's current position x multiplier) and
+		// sends whatever delta closes the gap - not a replay of one
+		// execution's own delta. This is idempotent: a follower already at
+		// its target produces delta 0 and nothing is sent, so it is safe to
+		// call after every master execution unconditionally, including stop
+		// fills the follower's own mirrored stop may or may not have already
+		// handled. This is also exactly what makes it self-healing for a
+		// follower that was out of sync for any reason going in.
+		private void SyncFollowerPositions(Instrument instrument)
 		{
-			int masterSignedDelta = (masterOrder.OrderAction == OrderAction.Buy || masterOrder.OrderAction == OrderAction.BuyToCover)
-				? execution.Quantity
-				: -execution.Quantity;
-
 			foreach (AccountState follower in followers)
 			{
 				if (follower.IsLocked)
-				{
-					RaiseLog(LogSeverity.Warning, string.Format(
-						"{0}: skipped copy of {1} x{2} on {3} - account is locked.",
-						follower.DisplayName, masterOrder.OrderAction, execution.Quantity, execution.Instrument.FullName));
 					continue;
-				}
 
 				// One follower's failure must never stop the rest from being
-				// processed - this was the second bug: an uncaught exception
-				// here (or in reconciliation/stop-sync below) silently
-				// aborted the loop partway through the follower list.
+				// processed - an uncaught exception here used to silently
+				// abort the loop partway through the follower list.
 				try
 				{
-					int signedDeltaToSend;
+					int delta;
 					lock (engineLock)
 					{
-						signedDeltaToSend = ComputeFollowerSignedDelta(follower, execution.Instrument, masterSignedDelta);
+						int masterQty = GetPosition(master, instrument);
+						int followerQty = GetPosition(follower, instrument);
+						int targetQty = (int)Math.Round(masterQty * follower.QuantityMultiplier, MidpointRounding.AwayFromZero);
+						delta = targetQty - followerQty;
+
+						// MaxContracts is treated as a total-across-all-instruments
+						// cap on this account, matching NetPositionQuantity's
+						// rollup. Only ever clips a move that grows the position's
+						// magnitude - closing/reducing must always go through in
+						// full.
+						bool isIncreasing = delta != 0 && Math.Abs(followerQty + delta) > Math.Abs(followerQty);
+						if (isIncreasing && follower.MaxContracts > 0 && follower.MaxContracts < int.MaxValue)
+						{
+							int allowedRoom = follower.MaxContracts - follower.NetPositionQuantity;
+							if (allowedRoom <= 0)
+							{
+								RaiseLog(LogSeverity.Warning, string.Format(
+									"{0}: sync on {1} skipped - already at MaxContracts ({2}).",
+									follower.DisplayName, instrument.FullName, follower.MaxContracts));
+								delta = 0;
+							}
+							else if (Math.Abs(delta) > allowedRoom)
+							{
+								int clipped = delta > 0 ? allowedRoom : -allowedRoom;
+								RaiseLog(LogSeverity.Warning, string.Format(
+									"{0}: sync on {1} clipped from {2} to {3} - MaxContracts limit ({4}).",
+									follower.DisplayName, instrument.FullName, delta, clipped, follower.MaxContracts));
+								delta = clipped;
+							}
+						}
 					}
 
-					if (signedDeltaToSend == 0)
+					if (delta == 0)
 						continue;
 
-					OrderAction action = signedDeltaToSend > 0 ? OrderAction.Buy : OrderAction.Sell;
-					SubmitOrder(follower, execution.Instrument, action, OrderType.Market,
-						Math.Abs(signedDeltaToSend), 0, 0, "Copier-" + execution.ExecutionId);
+					OrderAction action = delta > 0 ? OrderAction.Buy : OrderAction.Sell;
+					SubmitOrder(follower, instrument, action, OrderType.Market, Math.Abs(delta), 0, 0,
+						"Copier-" + follower.DisplayName + "-" + instrument.FullName);
 				}
 				catch (Exception ex)
 				{
 					RaiseLog(LogSeverity.Error, string.Format(
-						"{0}: copy failed on {1} - {2}. Other followers are still processed; reconciliation will catch any resulting drift.",
-						follower.DisplayName, execution.Instrument.FullName, ex.Message));
+						"{0}: position sync failed on {1} - {2}. Other followers are still processed.",
+						follower.DisplayName, instrument.FullName, ex.Message));
 				}
 			}
-		}
-
-		// Must be called while holding engineLock - reads/writes CopyQuantityCarry
-		// and reads NetPositionQuantity. Truncate (not Floor) is used so the
-		// carry remainder behaves correctly for negative (closing/short)
-		// deltas too, not just positive ones.
-		private int ComputeFollowerSignedDelta(AccountState follower, Instrument instrument, int masterSignedDelta)
-		{
-			decimal exact = masterSignedDelta * follower.QuantityMultiplier + follower.CopyQuantityCarry;
-			int wholeContracts = (int)Math.Truncate(exact);
-			follower.CopyQuantityCarry = exact - wholeContracts;
-
-			if (wholeContracts == 0)
-				return 0;
-
-			int currentPosition = GetPosition(follower, instrument);
-			bool isIncreasing = Math.Abs(currentPosition + wholeContracts) > Math.Abs(currentPosition);
-
-			// MaxContracts is treated as a total-across-all-instruments cap on
-			// this account, matching NetPositionQuantity's rollup. If you
-			// intended a per-instrument cap instead, this needs revisiting.
-			// Only ever clips a position-increasing move - a closing/reducing
-			// trade must always be allowed through in full.
-			if (isIncreasing && follower.MaxContracts > 0 && follower.MaxContracts < int.MaxValue)
-			{
-				int allowedRoom = follower.MaxContracts - follower.NetPositionQuantity;
-				if (allowedRoom <= 0)
-				{
-					RaiseLog(LogSeverity.Warning, string.Format(
-						"{0}: copy of {1} contracts skipped - already at MaxContracts ({2}).",
-						follower.DisplayName, wholeContracts, follower.MaxContracts));
-					return 0;
-				}
-				if (Math.Abs(wholeContracts) > allowedRoom)
-				{
-					int clipped = wholeContracts > 0 ? allowedRoom : -allowedRoom;
-					RaiseLog(LogSeverity.Warning, string.Format(
-						"{0}: copy clipped from {1} to {2} contracts - MaxContracts limit ({3}).",
-						follower.DisplayName, wholeContracts, clipped, follower.MaxContracts));
-					wholeContracts = clipped;
-				}
-			}
-
-			return wholeContracts;
 		}
 
 		// Reconciles master's currently-tracked stop for one instrument against
