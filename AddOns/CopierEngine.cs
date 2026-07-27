@@ -65,6 +65,21 @@ namespace NinjaTrader.NinjaScript.AddOns
 		private readonly Dictionary<AccountState, Dictionary<Instrument, Order>> followerStopByInstrument =
 			new Dictionary<AccountState, Dictionary<Instrument, Order>>();
 
+		// The sync/reconcile order (if any) this engine is currently waiting
+		// to resolve, per follower+instrument. GetPosition() cannot reflect a
+		// fill NT8 hasn't confirmed yet, so the target-based math in
+		// SyncFollowerPositions/RunReconciliation is only trustworthy between
+		// fills, not while one of our own orders is still working. Without
+		// this gate, two master executions arriving close together (e.g. a
+		// close filling as two partial fills a few ms apart) each recompute
+		// delta from the same stale followerQty and both send a correction -
+		// the second one on top of the first, not instead of it. Cleared the
+		// moment OnFollowerOrderUpdate sees this exact order reach a terminal
+		// state, which also re-runs the sync so a still-outstanding delta
+		// isn't stuck waiting for the next master execution.
+		private readonly Dictionary<AccountState, Dictionary<Instrument, Order>> pendingSyncOrderByInstrument =
+			new Dictionary<AccountState, Dictionary<Instrument, Order>>();
+
 		public event EventHandler<CopierLogEventArgs> LogMessage;
 
 		// Reconciliation default is warn-only. Per CLAUDE.md: when unsure,
@@ -125,6 +140,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 				positionByInstrument.Clear();
 				masterStopByInstrument.Clear();
 				followerStopByInstrument.Clear();
+				pendingSyncOrderByInstrument.Clear();
 				processedExecutionIds.Clear();
 				processedExecutionIdOrder.Clear();
 			}
@@ -204,13 +220,24 @@ namespace NinjaTrader.NinjaScript.AddOns
 							if (!AutoCorrectReconciliation)
 								continue;
 
+							// Same in-flight gate as SyncFollowerPositions: keep
+							// warning every cycle (above) even while a correction
+							// is already working, but never send a second order
+							// on top of one whose fill hasn't come back yet.
+							Order pendingReconcileOrder;
+							if (GetPendingSyncMap(follower).TryGetValue(instrument, out pendingReconcileOrder) && pendingReconcileOrder != null)
+								continue;
+
 							// NOTE: uses the plain Buy/Sell pair, not SellShort/BuyToCover -
 							// verify this is the right action pair for how your follower
 							// accounts are configured (futures accounts are usually fine
 							// with Buy/Sell for both opening and closing).
 							OrderAction action = delta > 0 ? OrderAction.Buy : OrderAction.Sell;
-							SubmitOrder(follower, instrument, action, OrderType.Market, Math.Abs(delta), 0, 0,
+							Order sentReconcileOrder = SubmitOrder(follower, instrument, action, OrderType.Market, Math.Abs(delta), 0, 0,
 								"Reconcile-" + follower.DisplayName);
+
+							if (sentReconcileOrder != null)
+								GetPendingSyncMap(follower)[instrument] = sentReconcileOrder;
 						}
 					}
 				}
@@ -364,6 +391,38 @@ namespace NinjaTrader.NinjaScript.AddOns
 			{
 				follower.IncrementOrdersFilled();
 			}
+
+			if (!IsOrderTerminal(order.OrderState))
+				return;
+
+			// A terminal state here means one of two gates this engine holds
+			// open elsewhere may now be clear: (a) a sync/reconcile order this
+			// follower+instrument was waiting on (see pendingSyncOrderByInstrument),
+			// or (b) a mirrored stop SyncFollowerPositions cancelled and
+			// deferred a flatten behind. Either way, GetPosition() is ground
+			// truth again once the matching execution(s) have been applied,
+			// so re-running the sync now - instead of waiting for the next
+			// master execution - is what actually sends a delta that was
+			// deliberately held back.
+			bool wasPendingSync;
+			bool wasTrackedStop;
+			lock (engineLock)
+			{
+				Dictionary<Instrument, Order> pendingMap = GetPendingSyncMap(follower);
+				Order pendingOrder;
+				wasPendingSync = pendingMap.TryGetValue(order.Instrument, out pendingOrder) && ReferenceEquals(pendingOrder, order);
+				if (wasPendingSync)
+					pendingMap.Remove(order.Instrument);
+
+				Dictionary<Instrument, Order> stopMap = GetFollowerStopMap(follower);
+				Order trackedStop;
+				wasTrackedStop = stopMap.TryGetValue(order.Instrument, out trackedStop) && ReferenceEquals(trackedStop, order);
+				if (wasTrackedStop)
+					stopMap.Remove(order.Instrument);
+			}
+
+			if (wasPendingSync || wasTrackedStop)
+				SyncFollowerPositions(order.Instrument);
 		}
 
 		// NOTE: AccountItem.RealizedProfitLoss is reported by NinjaTrader
@@ -433,17 +492,77 @@ namespace NinjaTrader.NinjaScript.AddOns
 					// list.
 					try
 					{
+						// A sync/reconcile order from an earlier call may still
+						// be working - GetPosition() cannot yet reflect a fill
+						// NT8 hasn't confirmed, so recomputing delta now would
+						// double-submit on top of it instead of replacing it.
+						// OnFollowerOrderUpdate clears this and re-runs the sync
+						// itself the moment the order resolves either way.
+						Order pendingOrder;
+						if (GetPendingSyncMap(follower).TryGetValue(instrument, out pendingOrder) && pendingOrder != null)
+						{
+							RaiseLog(LogSeverity.Info, string.Format(
+								"{0}: sync on {1} deferred - previous sync order still in flight.",
+								follower.DisplayName, instrument.FullName));
+							continue;
+						}
+
 						int masterQty = GetPosition(master, instrument);
 						int followerQty = GetPosition(follower, instrument);
 						int targetQty = (int)Math.Round(masterQty * follower.QuantityMultiplier, MidpointRounding.AwayFromZero);
 						int delta = targetQty - followerQty;
+
+						if (delta == 0)
+							continue;
+
+						// Master going flat means the follower's own mirrored
+						// stop (if any) is about to become meaningless. Firing
+						// the market flatten below WHILE that stop is still
+						// working races it - if the stop fills too, the
+						// follower flips to the opposite side instead of
+						// landing flat (this happened in production). Cancel
+						// the stop and defer the flatten entirely rather than
+						// guessing who wins the race: OnFollowerOrderUpdate
+						// re-runs this sync once the cancel (or a beat-us-to-it
+						// fill) confirms, by which point GetPosition is ground
+						// truth again and the remaining delta, if any, is safe
+						// to send.
+						if (targetQty == 0)
+						{
+							Dictionary<Instrument, Order> followerStops = GetFollowerStopMap(follower);
+							Order existingStop;
+							if (followerStops.TryGetValue(instrument, out existingStop) && existingStop != null
+								&& !IsOrderTerminal(existingStop.OrderState))
+							{
+								followerStops.Remove(instrument);
+								CancelOrder(follower, existingStop, "master flat - cancelling mirrored stop before flattening follower");
+
+								// Track the stop itself as what this follower+
+								// instrument is waiting on - reuses the exact
+								// same in-flight gate the market sync order
+								// below uses (whichever order is tracked here,
+								// OnFollowerOrderUpdate/ClearPendingSyncOrderIfMatching
+								// clear it by reference on its own terminal
+								// state, not by caring which method sent it).
+								// That is what fires the actual flatten once
+								// the cancel - or a beat-us-to-it fill - confirms,
+								// and what stops a second trigger in the
+								// meantime from cancelling the same stop twice.
+								GetPendingSyncMap(follower)[instrument] = existingStop;
+
+								RaiseLog(LogSeverity.Info, string.Format(
+									"{0}: flatten on {1} deferred until mirrored stop cancel/fill confirms - avoids racing both closes at once.",
+									follower.DisplayName, instrument.FullName));
+								continue;
+							}
+						}
 
 						// MaxContracts is treated as a total-across-all-instruments
 						// cap on this account, matching NetPositionQuantity's
 						// rollup. Only ever clips a move that grows the position's
 						// magnitude - closing/reducing must always go through in
 						// full.
-						bool isIncreasing = delta != 0 && Math.Abs(followerQty + delta) > Math.Abs(followerQty);
+						bool isIncreasing = Math.Abs(followerQty + delta) > Math.Abs(followerQty);
 						if (isIncreasing && follower.MaxContracts > 0 && follower.MaxContracts < int.MaxValue)
 						{
 							int allowedRoom = follower.MaxContracts - follower.NetPositionQuantity;
@@ -468,8 +587,11 @@ namespace NinjaTrader.NinjaScript.AddOns
 							continue;
 
 						OrderAction action = delta > 0 ? OrderAction.Buy : OrderAction.Sell;
-						SubmitOrder(follower, instrument, action, OrderType.Market, Math.Abs(delta), 0, 0,
+						Order sentOrder = SubmitOrder(follower, instrument, action, OrderType.Market, Math.Abs(delta), 0, 0,
 							"Copier-" + follower.DisplayName + "-" + instrument.FullName);
+
+						if (sentOrder != null)
+							GetPendingSyncMap(follower)[instrument] = sentOrder;
 					}
 					catch (Exception ex)
 					{
@@ -534,9 +656,7 @@ namespace NinjaTrader.NinjaScript.AddOns
 							continue; // follower's copied entry hasn't filled yet - retried on its next execution
 
 						bool upToDate = existingStop != null
-							&& existingStop.OrderState != OrderState.Cancelled
-							&& existingStop.OrderState != OrderState.Rejected
-							&& existingStop.OrderState != OrderState.Filled
+							&& !IsOrderTerminal(existingStop.OrderState)
 							&& existingStop.StopPrice == masterStop.StopPrice
 							&& existingStop.Quantity == desiredQuantity;
 
@@ -591,11 +711,26 @@ namespace NinjaTrader.NinjaScript.AddOns
 					? execution.Quantity
 					: -execution.Quantity;
 				AdjustPosition(state, execution.Instrument, signedDelta);
+				ClearPendingSyncOrderIfMatching(state, execution.Instrument, execution.Order);
 			}
 			else
 			{
 				ResyncPositionFromAccount(state, execution.Instrument);
 			}
+		}
+
+		// Must be called while holding engineLock. Opens the in-flight gate
+		// back up as soon as a real fill for the order it was waiting on has
+		// been applied to position - deliberately in the same lock
+		// acquisition as AdjustPosition above, not from the separate
+		// OrderUpdate event, so there is no window where the gate is clear
+		// but GetPosition() still hasn't caught up.
+		private void ClearPendingSyncOrderIfMatching(AccountState state, Instrument instrument, Order order)
+		{
+			Dictionary<Instrument, Order> pendingMap = GetPendingSyncMap(state);
+			Order pendingOrder;
+			if (pendingMap.TryGetValue(instrument, out pendingOrder) && ReferenceEquals(pendingOrder, order))
+				pendingMap.Remove(instrument);
 		}
 
 		// Must be called while holding engineLock. Ground truth from
@@ -689,6 +824,25 @@ namespace NinjaTrader.NinjaScript.AddOns
 				followerStopByInstrument[follower] = map;
 			}
 			return map;
+		}
+
+		private Dictionary<Instrument, Order> GetPendingSyncMap(AccountState state)
+		{
+			Dictionary<Instrument, Order> map;
+			if (!pendingSyncOrderByInstrument.TryGetValue(state, out map))
+			{
+				map = new Dictionary<Instrument, Order>();
+				pendingSyncOrderByInstrument[state] = map;
+			}
+			return map;
+		}
+
+		// Matches the "still alive" check SyncFollowerStops already relied on
+		// (existingStop.OrderState != Cancelled/Rejected/Filled) - factored
+		// out since the in-flight sync gate needs the identical check.
+		private static bool IsOrderTerminal(OrderState state)
+		{
+			return state == OrderState.Filled || state == OrderState.Cancelled || state == OrderState.Rejected;
 		}
 
 		private AccountState FindFollower(Account account)
