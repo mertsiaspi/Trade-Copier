@@ -422,13 +422,32 @@ namespace NinjaTrader.Gui.NinjaScript
 		// off), and I could not confirm exact key names for a plain
 		// window/DataGrid background. These colors are hand-picked to match
 		// NinjaTrader's own dark skin closely; tell me if they clash.
-		private static readonly Brush ThemeBackground = new SolidColorBrush(Color.FromRgb(0x1E, 0x1E, 0x1E));
-		private static readonly Brush ThemePanelBackground = new SolidColorBrush(Color.FromRgb(0x25, 0x25, 0x26));
-		private static readonly Brush ThemeRowBackground = new SolidColorBrush(Color.FromRgb(0x2D, 0x2D, 0x30));
-		private static readonly Brush ThemeRowAltBackground = new SolidColorBrush(Color.FromRgb(0x26, 0x26, 0x28));
-		private static readonly Brush ThemeHeaderBackground = new SolidColorBrush(Color.FromRgb(0x33, 0x33, 0x36));
-		private static readonly Brush ThemeBorder = new SolidColorBrush(Color.FromRgb(0x3F, 0x3F, 0x46));
-		private static readonly Brush ThemeForeground = new SolidColorBrush(Color.FromRgb(0xE0, 0xE0, 0xE0));
+		private static readonly Brush ThemeBackground = CreateFrozenBrush(0x1E, 0x1E, 0x1E);
+		private static readonly Brush ThemePanelBackground = CreateFrozenBrush(0x25, 0x25, 0x26);
+		private static readonly Brush ThemeRowBackground = CreateFrozenBrush(0x2D, 0x2D, 0x30);
+		private static readonly Brush ThemeRowAltBackground = CreateFrozenBrush(0x26, 0x26, 0x28);
+		private static readonly Brush ThemeHeaderBackground = CreateFrozenBrush(0x33, 0x33, 0x36);
+		private static readonly Brush ThemeBorder = CreateFrozenBrush(0x3F, 0x3F, 0x46);
+		private static readonly Brush ThemeForeground = CreateFrozenBrush(0xE0, 0xE0, 0xE0);
+
+		// Frozen, not just created - an unfrozen Freezable (SolidColorBrush
+		// included) has thread affinity to whichever Dispatcher thread ran
+		// its initializer. These are static fields, shared by every
+		// CopierWindow instance, and NT8 opens AddOn windows via
+		// Globals.RandomDispatcher - which can hand different instances to
+		// different UI threads. A second window on a different thread
+		// touching an unfrozen brush (WPF sealing a Style's Setters, e.g. on
+		// DataGridCell.BeginEdit for EditingElementStyle) throws "The
+		// calling thread cannot access this object because a different
+		// thread owns it." Freeze() removes the thread affinity entirely -
+		// a frozen Freezable is immutable and safe to read from any thread,
+		// which is all a flat theme color is ever used for here.
+		private static Brush CreateFrozenBrush(byte r, byte g, byte b)
+		{
+			SolidColorBrush brush = new SolidColorBrush(Color.FromRgb(r, g, b));
+			brush.Freeze();
+			return brush;
+		}
 
 		// Display-only heuristics for warning colors - these do NOT affect
 		// actual risk enforcement, RiskManager decides that independently.
@@ -547,15 +566,30 @@ namespace NinjaTrader.Gui.NinjaScript
 				AccountRow row;
 				if (!existing.TryGetValue(account, out row))
 				{
-					AccountState state = new AccountState(account, AccountRole.Follower);
-					// Must happen before the AccountRow is constructed -
-					// AccountRow's constructor reads StartingBalance
-					// immediately to pre-fill the starting-balance text box,
-					// and restoring first is what makes "don't touch the
-					// field, just hit Rearm" preserve the real trailing
-					// HighWaterMark instead of re-seeding it from today's
-					// current equity.
-					CopierSettings.TryRestore(state);
+					// A brand-new window's accountRows starts empty, so every
+					// connected account looks "new" to it even if
+					// CopierManager is already armed and actively tracking it
+					// (e.g. this is a second dashboard window opened while
+					// running). Reusing the live AccountState in that case -
+					// instead of restoring a slightly-stale on-disk snapshot
+					// (CopierSettings only saves once per ~1s tick) into a
+					// separate object - is what keeps a Rearm from this
+					// window from replacing the running engine's real
+					// HighWaterMark/DrawdownFloor/lock state with an older
+					// copy.
+					AccountState state = FindLiveTrackedState(account);
+					if (state == null)
+					{
+						state = new AccountState(account, AccountRole.Follower);
+						// Must happen before the AccountRow is constructed -
+						// AccountRow's constructor reads StartingBalance
+						// immediately to pre-fill the starting-balance text
+						// box, and restoring first is what makes "don't touch
+						// the field, just hit Rearm" preserve the real
+						// trailing HighWaterMark instead of re-seeding it from
+						// today's current equity.
+						CopierSettings.TryRestore(state);
+					}
 					row = new AccountRow(state);
 				}
 				accountRows.Add(row);
@@ -568,6 +602,25 @@ namespace NinjaTrader.Gui.NinjaScript
 				masterCombo.SelectedIndex = 0;
 
 			RecomputeRoles();
+		}
+
+		// If CopierManager is already running and tracking this account,
+		// returns its live AccountState instead of letting the caller build
+		// a fresh/restored one - see the comment at the RebuildAccountRows
+		// call site for why that distinction matters.
+		private static AccountState FindLiveTrackedState(Account account)
+		{
+			if (!CopierManager.IsRunning)
+				return null;
+
+			if (ReferenceEquals(CopierManager.Master.NinjaAccount, account))
+				return CopierManager.Master;
+
+			foreach (AccountState follower in CopierManager.Followers)
+				if (ReferenceEquals(follower.NinjaAccount, account))
+					return follower;
+
+			return null;
 		}
 
 		private void OnMasterComboSelectionChanged(object sender, SelectionChangedEventArgs e)

@@ -141,13 +141,18 @@ namespace NinjaTrader.NinjaScript.AddOns
 					// directly over the real file, so a process kill mid-write
 					// can never leave a half-written, corrupt settings file
 					// behind - worst case, the temp file is orphaned and the
-					// previous good save is untouched.
+					// previous good save is untouched. File.Replace does this
+					// as one atomic filesystem operation with no gap where
+					// the destination briefly doesn't exist; it only requires
+					// the destination to already exist, so the very first
+					// save (no file yet) falls back to a plain move.
 					string tempPath = FilePath + ".tmp";
 					root.Save(tempPath);
 
 					if (File.Exists(FilePath))
-						File.Delete(FilePath);
-					File.Move(tempPath, FilePath);
+						File.Replace(tempPath, FilePath, null);
+					else
+						File.Move(tempPath, FilePath);
 				}
 				catch (Exception ex)
 				{
