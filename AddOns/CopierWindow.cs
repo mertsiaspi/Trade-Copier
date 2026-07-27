@@ -383,6 +383,18 @@ namespace NinjaTrader.Gui.NinjaScript
 			}
 		}
 
+		public string FloorBuffer
+		{
+			get { return State.FloorSafetyBuffer.ToString(CultureInfo.InvariantCulture); }
+			set
+			{
+				decimal parsed;
+				if (decimal.TryParse(value, out parsed))
+					State.FloorSafetyBuffer = parsed;
+				Raise("FloorBuffer");
+			}
+		}
+
 		// Plain pending text, deliberately NOT proxied straight onto State -
 		// see the class-level comment above.
 		public string PendingStartingBalance { get; set; }
@@ -812,6 +824,14 @@ namespace NinjaTrader.Gui.NinjaScript
 			freezeColumn.EditingElementStyle = BuildEditingTextBoxStyle();
 			grid.Columns.Add(freezeColumn);
 
+			// Margin RiskManager breaches at BEFORE the real floor - a 1s
+			// evaluation timer can miss the exact instant equity peaks, so
+			// this buys room for that lag. 0 (default) = off, raw floor used
+			// as-is.
+			DataGridTextColumn floorBufferColumn = new DataGridTextColumn { Header = "Floor Safety Buffer", Binding = new Binding("FloorBuffer") { Mode = BindingMode.TwoWay } };
+			floorBufferColumn.EditingElementStyle = BuildEditingTextBoxStyle();
+			grid.Columns.Add(floorBufferColumn);
+
 			root.Children.Add(grid);
 			return root;
 		}
@@ -980,8 +1000,8 @@ namespace NinjaTrader.Gui.NinjaScript
 
 			if (state.MaxDrawdownAmount > 0)
 			{
-				row.AutoLiquidateFloor = state.DrawdownFloor.ToString("C");
-				decimal distance = equity - state.DrawdownFloor;
+				row.AutoLiquidateFloor = state.EffectiveDrawdownFloor.ToString("C");
+				decimal distance = equity - state.EffectiveDrawdownFloor;
 				row.DistanceToAuto = distance.ToString("C");
 				row.DistanceToAutoBrush = DistanceBrush(distance);
 			}
@@ -1025,7 +1045,7 @@ namespace NinjaTrader.Gui.NinjaScript
 
 		private static bool IsNearLimit(AccountState state, decimal equity)
 		{
-			if (state.MaxDrawdownAmount > 0 && (equity - state.DrawdownFloor) <= state.MaxDrawdownAmount * WarningThresholdFraction)
+			if (state.MaxDrawdownAmount > 0 && (equity - state.EffectiveDrawdownFloor) <= state.MaxDrawdownAmount * WarningThresholdFraction)
 				return true;
 
 			if (state.DailyRiskBudget > 0)

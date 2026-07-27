@@ -50,6 +50,25 @@ namespace NinjaTrader.NinjaScript.AddOns
 		public decimal MaxDrawdownAmount { get; set; }
 		public decimal StartingBalance { get; private set; }
 
+		// Extra safety margin RiskManager breaches at BEFORE the real
+		// drawdown floor, not instead of it - a 1s evaluation timer plus
+		// AccountItemUpdate's own update granularity can miss the exact
+		// instant unrealized P&L peaks, so without a margin the firm's own
+		// trailing floor can move past where this tool last saw it before
+		// the next check catches up. 0 (default) means no margin - the raw
+		// floor is used as-is, matching every account configured before this
+		// field existed.
+		public decimal FloorSafetyBuffer { get; set; }
+
+		// What RiskManager actually breaches against - see FloorSafetyBuffer.
+		// Read this (not DrawdownFloor directly) anywhere "the auto-flatten
+		// trigger level" is displayed or checked, so the dashboard's number
+		// always matches what will actually fire.
+		public decimal EffectiveDrawdownFloor
+		{
+			get { return DrawdownFloor + FloorSafetyBuffer; }
+		}
+
 		// Apex-style trailing freezes once the floor reaches StartingBalance +
 		// this offset (Apex uses 100). Set to 0 for firms whose trailing never
 		// freezes and simply keeps trailing the whole account lifetime.

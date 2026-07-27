@@ -54,11 +54,12 @@ namespace NinjaTrader.NinjaScript.AddOns
 
 			decimal equity = GetLiveEquity(state);
 
-			if (state.MaxDrawdownAmount > 0 && equity <= state.DrawdownFloor)
+			if (state.MaxDrawdownAmount > 0 && equity <= state.EffectiveDrawdownFloor)
 			{
 				RaiseBreach(state, RiskBreachType.TrailingDrawdown,
-					string.Format("{0}: equity {1:C} <= drawdown floor {2:C} ({3})",
-						state.DisplayName, equity, state.DrawdownFloor, state.DrawdownType));
+					string.Format("{0}: equity {1:C} <= drawdown floor {2:C} (raw floor {3:C} + {4:C} safety buffer) ({5})",
+						state.DisplayName, equity, state.EffectiveDrawdownFloor, state.DrawdownFloor,
+						state.FloorSafetyBuffer, state.DrawdownType));
 				return;
 			}
 
