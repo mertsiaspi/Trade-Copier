@@ -23,6 +23,35 @@ namespace NinjaTrader.NinjaScript.AddOns
 		EndOfDay
 	}
 
+	// Everything CopierSettings persists across NT8 restarts - configuration
+	// AND the live risk state RiskManager has computed so far. Deliberately
+	// excludes NetPositionQuantity/PositionDirection/DailyRealizedPnL/
+	// DailyUnrealizedPnL - those always come straight from the live account
+	// on Start() (CopierEngine.SeedAccountPositions/SeedAccountPnl), and a
+	// saved snapshot of them could go stale (a manual trade, a fill while
+	// offline) in exactly the way persisting the risk-tracking fields below
+	// is meant to avoid.
+	public class AccountSnapshot
+	{
+		public decimal QuantityMultiplier;
+		public int MaxContracts;
+		public decimal DailyRiskBudget;
+		public DrawdownType DrawdownType;
+		public decimal MaxDrawdownAmount;
+		public decimal FloorSafetyBuffer;
+		public decimal StartingBalance;
+		public decimal TrailingStopFreezeOffset;
+		public decimal HighWaterMark;
+		public decimal EndOfDayBalance;
+		public decimal DrawdownFloor;
+		public bool IsTrailingFrozen;
+		public bool IsLocked;
+		public string LockReason;
+		public int OrdersSent;
+		public int OrdersFilled;
+		public int OrdersRejected;
+	}
+
 	// Plain per-account state holder: identity, copy settings, configured risk
 	// limits, live PnL/position, lock state, and copy stats. No risk decisions
 	// or trailing-DD math here - that belongs in RiskManager, which reads and
@@ -172,6 +201,72 @@ namespace NinjaTrader.NinjaScript.AddOns
 		public void IncrementOrdersRejected()
 		{
 			lock (stateLock) { OrdersRejected++; }
+		}
+
+		// Reads every field CopierSettings persists - see AccountSnapshot's
+		// comment for exactly what is and is not included.
+		public AccountSnapshot CaptureSnapshot()
+		{
+			lock (stateLock)
+			{
+				return new AccountSnapshot
+				{
+					QuantityMultiplier = QuantityMultiplier,
+					MaxContracts = MaxContracts,
+					DailyRiskBudget = DailyRiskBudget,
+					DrawdownType = DrawdownType,
+					MaxDrawdownAmount = MaxDrawdownAmount,
+					FloorSafetyBuffer = FloorSafetyBuffer,
+					StartingBalance = StartingBalance,
+					TrailingStopFreezeOffset = TrailingStopFreezeOffset,
+					HighWaterMark = HighWaterMark,
+					EndOfDayBalance = EndOfDayBalance,
+					DrawdownFloor = DrawdownFloor,
+					IsTrailingFrozen = IsTrailingFrozen,
+					IsLocked = IsLocked,
+					LockReason = LockReason,
+					OrdersSent = OrdersSent,
+					OrdersFilled = OrdersFilled,
+					OrdersRejected = OrdersRejected
+				};
+			}
+		}
+
+		// Restores every persisted field directly - deliberately bypasses
+		// InitializeBalances (which seeds HighWaterMark/EndOfDayBalance
+		// together from a single starting balance - restoring them
+		// independently is the whole point here) and Lock/ResetForNewDay
+		// (which only ever move lock state one direction at a time). This is
+		// for CopierSettings reconstructing a previous session's exact state
+		// on startup, not for any other caller - anyone else changing these
+		// fields during a running session should go through
+		// InitializeBalances/Lock/ResetForNewDay instead so the invariants
+		// those enforce keep holding.
+		public void RestoreSnapshot(AccountSnapshot snapshot)
+		{
+			if (snapshot == null)
+				return;
+
+			lock (stateLock)
+			{
+				QuantityMultiplier = snapshot.QuantityMultiplier;
+				MaxContracts = snapshot.MaxContracts;
+				DailyRiskBudget = snapshot.DailyRiskBudget;
+				DrawdownType = snapshot.DrawdownType;
+				MaxDrawdownAmount = snapshot.MaxDrawdownAmount;
+				FloorSafetyBuffer = snapshot.FloorSafetyBuffer;
+				StartingBalance = snapshot.StartingBalance;
+				TrailingStopFreezeOffset = snapshot.TrailingStopFreezeOffset;
+				HighWaterMark = snapshot.HighWaterMark;
+				EndOfDayBalance = snapshot.EndOfDayBalance;
+				DrawdownFloor = snapshot.DrawdownFloor;
+				IsTrailingFrozen = snapshot.IsTrailingFrozen;
+				IsLocked = snapshot.IsLocked;
+				LockReason = snapshot.LockReason;
+				OrdersSent = snapshot.OrdersSent;
+				OrdersFilled = snapshot.OrdersFilled;
+				OrdersRejected = snapshot.OrdersRejected;
+			}
 		}
 	}
 }

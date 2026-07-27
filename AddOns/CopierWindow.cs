@@ -144,6 +144,19 @@ namespace NinjaTrader.Gui.NinjaScript
 				}
 			}
 
+			// Cheap enough to do every tick for a handful of accounts - a
+			// crash can then never lose more than the last second of risk
+			// state (HighWaterMark, DrawdownFloor, lock state included).
+			try
+			{
+				List<AccountState> allAccounts = new List<AccountState>(Followers) { Master };
+				CopierSettings.SaveAll(allAccounts);
+			}
+			catch (Exception ex)
+			{
+				Engine.Log(LogSeverity.Error, "Settings/risk-state save failed - " + ex.Message);
+			}
+
 			EventHandler handler = Tick;
 			if (handler != null)
 				handler(null, EventArgs.Empty);
@@ -460,6 +473,7 @@ namespace NinjaTrader.Gui.NinjaScript
 				RebuildAccountRows();
 				RefreshAllRows();
 				CopierManager.Tick += OnManagerTick;
+				CopierSettings.LogMessage += OnEngineLogMessage;
 			};
 		}
 
@@ -475,6 +489,7 @@ namespace NinjaTrader.Gui.NinjaScript
 			// closed, per CLAUDE.md's "risk management must not be chart/
 			// window bound".
 			CopierManager.Tick -= OnManagerTick;
+			CopierSettings.LogMessage -= OnEngineLogMessage;
 			if (subscribedEngine != null)
 				subscribedEngine.LogMessage -= OnEngineLogMessage;
 		}
@@ -531,7 +546,18 @@ namespace NinjaTrader.Gui.NinjaScript
 			{
 				AccountRow row;
 				if (!existing.TryGetValue(account, out row))
-					row = new AccountRow(new AccountState(account, AccountRole.Follower));
+				{
+					AccountState state = new AccountState(account, AccountRole.Follower);
+					// Must happen before the AccountRow is constructed -
+					// AccountRow's constructor reads StartingBalance
+					// immediately to pre-fill the starting-balance text box,
+					// and restoring first is what makes "don't touch the
+					// field, just hit Rearm" preserve the real trailing
+					// HighWaterMark instead of re-seeding it from today's
+					// current equity.
+					CopierSettings.TryRestore(state);
+					row = new AccountRow(state);
+				}
 				accountRows.Add(row);
 			}
 
