@@ -1,0 +1,272 @@
+using System;
+using NinjaTrader.Cbi;
+
+namespace NinjaTrader.NinjaScript.AddOns
+{
+	public enum AccountRole
+	{
+		Master,
+		Follower
+	}
+
+	// Different prop firms compute the drawdown floor differently - never
+	// hardcode one firm's rule, always dispatch on this per-account setting.
+	public enum DrawdownType
+	{
+		// Floor trails the account's real-time equity high-water mark. Apex:
+		// the floor stops rising once it reaches StartingBalance + freeze
+		// offset (see AccountState.TrailingStopFreezeOffset).
+		IntradayTrailing,
+
+		// Floor is fixed off the previous day's end-of-day realized balance
+		// and does not move with the current day's open P&L.
+		EndOfDay
+	}
+
+	// Everything CopierSettings persists across NT8 restarts - configuration
+	// AND the live risk state RiskManager has computed so far. Deliberately
+	// excludes NetPositionQuantity/PositionDirection/DailyRealizedPnL/
+	// DailyUnrealizedPnL - those always come straight from the live account
+	// on Start() (CopierEngine.SeedAccountPositions/SeedAccountPnl), and a
+	// saved snapshot of them could go stale (a manual trade, a fill while
+	// offline) in exactly the way persisting the risk-tracking fields below
+	// is meant to avoid.
+	public class AccountSnapshot
+	{
+		public decimal QuantityMultiplier;
+		public int MaxContracts;
+		public decimal DailyRiskBudget;
+		public DrawdownType DrawdownType;
+		public decimal MaxDrawdownAmount;
+		public decimal FloorSafetyBuffer;
+		public decimal StartingBalance;
+		public decimal TrailingStopFreezeOffset;
+		public decimal HighWaterMark;
+		public decimal EndOfDayBalance;
+		public decimal DrawdownFloor;
+		public bool IsTrailingFrozen;
+		public bool IsLocked;
+		public string LockReason;
+		public int OrdersSent;
+		public int OrdersFilled;
+		public int OrdersRejected;
+	}
+
+	// Plain per-account state holder: identity, copy settings, configured risk
+	// limits, live PnL/position, lock state, and copy stats. No risk decisions
+	// or trailing-DD math here - that belongs in RiskManager, which reads and
+	// updates this object.
+	public class AccountState
+	{
+		private readonly object stateLock = new object();
+
+		public Account NinjaAccount { get; }
+		public string DisplayName { get; }
+		public AccountRole Role { get; set; }
+
+		// Per-account copy settings
+		public decimal QuantityMultiplier { get; set; } = 1m;
+		public int MaxContracts { get; set; } = int.MaxValue;
+
+		// Configured risk limits (raw values, set from CopierSettings)
+		public decimal DailyRiskBudget { get; set; }
+
+		// Drawdown configuration - per account, per prop firm's actual rules.
+		// See DrawdownType. Set via InitializeBalances/CopierSettings, never
+		// hardcoded for "all Apex accounts" or similar, since firm rules and
+		// account sizes vary per account.
+		public DrawdownType DrawdownType { get; set; } = DrawdownType.IntradayTrailing;
+		public decimal MaxDrawdownAmount { get; set; }
+		public decimal StartingBalance { get; private set; }
+
+		// Extra safety margin RiskManager breaches at BEFORE the real
+		// drawdown floor, not instead of it - a 1s evaluation timer plus
+		// AccountItemUpdate's own update granularity can miss the exact
+		// instant unrealized P&L peaks, so without a margin the firm's own
+		// trailing floor can move past where this tool last saw it before
+		// the next check catches up. 0 (default) means no margin - the raw
+		// floor is used as-is, matching every account configured before this
+		// field existed.
+		public decimal FloorSafetyBuffer { get; set; }
+
+		// What RiskManager actually breaches against - see FloorSafetyBuffer.
+		// Read this (not DrawdownFloor directly) anywhere "the auto-flatten
+		// trigger level" is displayed or checked, so the dashboard's number
+		// always matches what will actually fire.
+		public decimal EffectiveDrawdownFloor
+		{
+			get { return DrawdownFloor + FloorSafetyBuffer; }
+		}
+
+		// Apex-style trailing freezes once the floor reaches StartingBalance +
+		// this offset (Apex uses 100). Set to 0 for firms whose trailing never
+		// freezes and simply keeps trailing the whole account lifetime.
+		public decimal TrailingStopFreezeOffset { get; set; }
+
+		// Live drawdown tracking - maintained by RiskManager.Evaluate, not set
+		// by hand. Exposed here so the dashboard can read them directly.
+		public decimal HighWaterMark { get; set; }
+		public decimal EndOfDayBalance { get; set; }
+		public decimal DrawdownFloor { get; set; }
+		public bool IsTrailingFrozen { get; set; }
+
+		// Live PnL, refreshed by the engine from account/position events
+		public decimal DailyRealizedPnL { get; set; }
+		public decimal DailyUnrealizedPnL { get; set; }
+		public decimal DailyPnL
+		{
+			get { return DailyRealizedPnL + DailyUnrealizedPnL; }
+		}
+
+		// Total open contracts across ALL instruments on this account (direction-
+		// agnostic sum of absolute per-instrument positions) - a rollup for the
+		// dashboard. CopierEngine tracks the real per-instrument signed
+		// breakdown itself (needed since master can hold MYM and MES at once);
+		// this field and PositionDirection below are a simplified summary only.
+		public int NetPositionQuantity { get; set; }
+
+		// Only fully meaningful when a single instrument is open - reflects
+		// whichever instrument's position was updated most recently. For a
+		// precise multi-instrument view, read CopierEngine's per-instrument map.
+		public MarketPosition PositionDirection { get; set; } = MarketPosition.Flat;
+
+		public bool IsLocked { get; private set; }
+		public string LockReason { get; private set; }
+
+		// Copy stats. All mutation goes through the methods below so callers on
+		// different event threads (execution, order update, reconciliation timer)
+		// can't race on the counters - this was bug #7 in SimpleTradeCopierV2.
+		public int OrdersSent { get; private set; }
+		public int OrdersFilled { get; private set; }
+		public int OrdersRejected { get; private set; }
+
+		public AccountState(Account account, AccountRole role)
+		{
+			if (account == null)
+				throw new ArgumentNullException("account");
+
+			NinjaAccount = account;
+			DisplayName = account.Name;
+			Role = role;
+		}
+
+		// Seeds the balances drawdown tracking is measured from. Call once,
+		// when the account's starting/funded balance becomes known from
+		// CopierSettings, before RiskManager.Evaluate runs for this account.
+		// StartingBalance has a private setter specifically so it can't be
+		// changed without also reseeding HighWaterMark/EndOfDayBalance.
+		public void InitializeBalances(decimal startingBalance)
+		{
+			StartingBalance = startingBalance;
+			HighWaterMark = startingBalance;
+			EndOfDayBalance = startingBalance;
+		}
+
+		public void Lock(string reason)
+		{
+			lock (stateLock)
+			{
+				IsLocked = true;
+				LockReason = reason;
+			}
+		}
+
+		// Called at the start of a new trading day to reset daily figures.
+		// Does not clear IsLocked implicitly for anything other than the daily
+		// lock - a manual kill-switch lock is expected to be cleared separately.
+		public void ResetForNewDay()
+		{
+			lock (stateLock)
+			{
+				IsLocked = false;
+				LockReason = null;
+				DailyRealizedPnL = 0m;
+				DailyUnrealizedPnL = 0m;
+				OrdersSent = 0;
+				OrdersFilled = 0;
+				OrdersRejected = 0;
+			}
+		}
+
+		public void IncrementOrdersSent()
+		{
+			lock (stateLock) { OrdersSent++; }
+		}
+
+		public void IncrementOrdersFilled()
+		{
+			lock (stateLock) { OrdersFilled++; }
+		}
+
+		public void IncrementOrdersRejected()
+		{
+			lock (stateLock) { OrdersRejected++; }
+		}
+
+		// Reads every field CopierSettings persists - see AccountSnapshot's
+		// comment for exactly what is and is not included.
+		public AccountSnapshot CaptureSnapshot()
+		{
+			lock (stateLock)
+			{
+				return new AccountSnapshot
+				{
+					QuantityMultiplier = QuantityMultiplier,
+					MaxContracts = MaxContracts,
+					DailyRiskBudget = DailyRiskBudget,
+					DrawdownType = DrawdownType,
+					MaxDrawdownAmount = MaxDrawdownAmount,
+					FloorSafetyBuffer = FloorSafetyBuffer,
+					StartingBalance = StartingBalance,
+					TrailingStopFreezeOffset = TrailingStopFreezeOffset,
+					HighWaterMark = HighWaterMark,
+					EndOfDayBalance = EndOfDayBalance,
+					DrawdownFloor = DrawdownFloor,
+					IsTrailingFrozen = IsTrailingFrozen,
+					IsLocked = IsLocked,
+					LockReason = LockReason,
+					OrdersSent = OrdersSent,
+					OrdersFilled = OrdersFilled,
+					OrdersRejected = OrdersRejected
+				};
+			}
+		}
+
+		// Restores every persisted field directly - deliberately bypasses
+		// InitializeBalances (which seeds HighWaterMark/EndOfDayBalance
+		// together from a single starting balance - restoring them
+		// independently is the whole point here) and Lock/ResetForNewDay
+		// (which only ever move lock state one direction at a time). This is
+		// for CopierSettings reconstructing a previous session's exact state
+		// on startup, not for any other caller - anyone else changing these
+		// fields during a running session should go through
+		// InitializeBalances/Lock/ResetForNewDay instead so the invariants
+		// those enforce keep holding.
+		public void RestoreSnapshot(AccountSnapshot snapshot)
+		{
+			if (snapshot == null)
+				return;
+
+			lock (stateLock)
+			{
+				QuantityMultiplier = snapshot.QuantityMultiplier;
+				MaxContracts = snapshot.MaxContracts;
+				DailyRiskBudget = snapshot.DailyRiskBudget;
+				DrawdownType = snapshot.DrawdownType;
+				MaxDrawdownAmount = snapshot.MaxDrawdownAmount;
+				FloorSafetyBuffer = snapshot.FloorSafetyBuffer;
+				StartingBalance = snapshot.StartingBalance;
+				TrailingStopFreezeOffset = snapshot.TrailingStopFreezeOffset;
+				HighWaterMark = snapshot.HighWaterMark;
+				EndOfDayBalance = snapshot.EndOfDayBalance;
+				DrawdownFloor = snapshot.DrawdownFloor;
+				IsTrailingFrozen = snapshot.IsTrailingFrozen;
+				IsLocked = snapshot.IsLocked;
+				LockReason = snapshot.LockReason;
+				OrdersSent = snapshot.OrdersSent;
+				OrdersFilled = snapshot.OrdersFilled;
+				OrdersRejected = snapshot.OrdersRejected;
+			}
+		}
+	}
+}
